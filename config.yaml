@@ -1,0 +1,46 @@
+# Pinglet Configuration
+
+slack:
+  token_env: SLACK_USER_TOKEN       # Environment variable name
+  default_channel: DXXXXXXXXXX        # Damien's DM channel
+
+notifications:
+  on_success: false                 # Silent on success
+  on_failure: true                  # Always alert on failure
+  slack_enabled: true
+  macos_enabled: true
+
+healthcheck:
+  enabled: true
+  schedule_hour: 20                 # 8 PM (after UCE evening run)
+  expected_intervals:               # Hours - alert if task hasn't run
+    uce: 14                         # UCE runs every 12h, allow 14h grace
+    git-sync: 2                     # Git-sync runs hourly, allow 2h grace
+
+tasks:
+  uce:
+    name: UCE Link Collector
+    command: /path/to/uce/venv/bin/python
+    args:
+      - runner.py
+    working_dir: /path/to/uce
+    timeout: 600                    # 10 minutes
+    env:
+      - SLACK_USER_TOKEN            # Pass through from parent env
+
+  git-sync:
+    name: Obsidian Git-Sync
+    command: /path/to/git-sync/venv/bin/python3
+    args:
+      - sync.py
+      - config.yaml
+    working_dir: /path/to/git-sync
+    timeout: 120                    # 2 minutes
+
+  # Future tasks can be added here:
+  # home-repo:
+  #   name: Home Repo Sync
+  #   command: /path/to/venv/bin/python
+  #   args: [sync.py]
+  #   working_dir: /path/to/home-repo
+  #   timeout: 60
