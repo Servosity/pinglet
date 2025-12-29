@@ -108,7 +108,7 @@ def send_macos_notification(title: str, message: str, sound: str = "default") ->
         return False
 
 
-def send_critical(task_name: str, error: str, details: dict = None, log_file: str = None) -> None:
+def send_critical(task_name: str, error: str, details: dict = None, log_file: str = None, task_id: str = None) -> None:
     """
     Send critical failure alert - Slack + macOS notification.
     Called for any non-zero exit code.
@@ -118,6 +118,7 @@ def send_critical(task_name: str, error: str, details: dict = None, log_file: st
         error: Error message
         details: Optional dict of additional details
         log_file: Path to log file for reference
+        task_id: Task identifier for manual retry command
     """
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -138,8 +139,13 @@ def send_critical(task_name: str, error: str, details: dict = None, log_file: st
         for key, value in details.items():
             slack_message += f"\n• {key}: {value}"
 
-    if log_file:
-        slack_message += f"\n\n*Log:* `{log_file}`"
+    # Add actionable commands
+    slack_message += f"""
+*Actions:*
+• Retry now: `cd ~/Documents/Dev/pinglet && ./venv/bin/python pinglet.py --task {task_id or 'TASK_NAME'}`
+• View logs: `tail -100 {log_file or '~/Documents/Dev/pinglet/logs/pinglet.log'}`
+• Check all tasks: `./venv/bin/python pinglet.py --list`
+"""
 
     # Send to Slack
     send_slack_message(slack_message)
@@ -193,11 +199,12 @@ def send_health_summary(tasks: list, healthy: bool = True) -> None:
         healthy: True if all tasks are healthy
     """
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_file = PROJECT_ROOT / "logs" / "pinglet.log"
 
     if healthy:
         header = "*All Systems Healthy*"
     else:
-        failed_count = sum(1 for t in tasks if t.get("issue"))
+        failed_count = sum(1 for t in tasks if t.get("issue") and t.get("issue") != "-")
         header = f"*ALERT: {failed_count} task(s) require attention*"
 
     slack_message = f"""*Pinglet Daily Health Check*
@@ -217,6 +224,15 @@ def send_health_summary(tasks: list, healthy: bool = True) -> None:
         status = task.get("status", "UNKNOWN")
         issue = task.get("issue", "-")
         slack_message += f"| {name} | {last_run} | {status} | {issue} |\n"
+
+    # Add actionable section if unhealthy
+    if not healthy:
+        slack_message += f"""
+*Actions:*
+• Check status: `cd ~/Documents/Dev/pinglet && ./venv/bin/python pinglet.py --list`
+• Run manually: `./venv/bin/python pinglet.py --task <task_name>`
+• View logs: `tail -50 {log_file}`
+"""
 
     send_slack_message(slack_message)
 

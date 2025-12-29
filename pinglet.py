@@ -147,6 +147,7 @@ def run_task(task_name: str) -> int:
                 "Duration": f"{duration:.1f}s",
             },
             log_file=str(get_log_file_path()),
+            task_id=task_name,
         )
 
     return exit_code
