@@ -16,6 +16,7 @@ healthcheck:
   expected_intervals:               # Hours - alert if task hasn't run
     uce: 14                         # UCE runs every 12h, allow 14h grace
     git-sync: 2                     # Git-sync runs hourly, allow 2h grace
+    claude-backup: 2                # Claude backup runs hourly, allow 2h grace
 
 tasks:
   uce:
@@ -36,6 +37,18 @@ tasks:
       - config.yaml
     working_dir: /path/to/git-sync
     timeout: 120                    # 2 minutes
+
+  claude-backup:
+    name: Claude Code Backup
+    command: /path/to/claude-backup/venv/bin/python
+    args:
+      - -m
+      - claude_backup
+      - --robot
+      - snapshot
+      - --auto
+    working_dir: /path/to/claude-backup
+    timeout: 300                    # 5 minutes
 
   # Future tasks can be added here:
   # home-repo:
