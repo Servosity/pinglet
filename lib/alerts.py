@@ -58,7 +58,7 @@ def send_slack_message(message: str, channel_id: str = None) -> bool:
         return False
 
 
-def send_macos_notification(title: str, message: str, sound: str = "default") -> bool:
+def send_macos_notification(title: str, message: str, sound: str = "default", open_file: str = None) -> bool:
     """
     Send a macOS notification via terminal-notifier (preferred) or osascript.
 
@@ -66,14 +66,21 @@ def send_macos_notification(title: str, message: str, sound: str = "default") ->
         title: Notification title
         message: Notification body
         sound: Sound name (default: "default")
+        open_file: Optional file path to open when clicking "Show"
 
     Returns:
         True on success, False on failure (non-critical)
     """
     try:
         # Try terminal-notifier first (more reliable, has its own notification permissions)
+        cmd = ["terminal-notifier", "-title", title, "-message", message, "-sound", sound]
+
+        # Add action to open file when clicking "Show"
+        if open_file:
+            cmd.extend(["-open", f"file://{open_file}"])
+
         result = subprocess.run(
-            ["terminal-notifier", "-title", title, "-message", message, "-sound", sound],
+            cmd,
             capture_output=True,
             timeout=5,
         )
@@ -150,10 +157,14 @@ def send_critical(task_name: str, error: str, details: dict = None, log_file: st
     # Send to Slack
     send_slack_message(slack_message)
 
-    # Also send macOS notification
+    # Also send macOS notification with more context
+    # Truncate error for notification but include actionable info
+    short_error = error[:80] if len(error) > 80 else error
+    notify_message = f"{short_error}\n\nClick Show to view logs."
     send_macos_notification(
         f"Pinglet: {task_name} Failed",
-        error[:100] if len(error) > 100 else error
+        notify_message,
+        open_file=log_file,
     )
 
     print(f"ALERT | Critical alert sent for {task_name}: {error[:50]}...")
@@ -238,9 +249,17 @@ def send_health_summary(tasks: list, healthy: bool = True) -> None:
 
     # Also send macOS notification if unhealthy
     if not healthy:
+        # Build task names list for notification
+        failing_tasks = [t.get("name") for t in tasks if t.get("issue") and t.get("issue") != "-"]
+        task_list = ", ".join(failing_tasks[:3])  # Show first 3
+        if len(failing_tasks) > 3:
+            task_list += f" +{len(failing_tasks) - 3} more"
+
+        notify_message = f"{failed_count} task(s): {task_list}\n\nClick Show to view logs."
         send_macos_notification(
             "Pinglet Health Alert",
-            f"{failed_count} task(s) need attention"
+            notify_message,
+            open_file=str(log_file),
         )
 
 
@@ -258,10 +277,12 @@ def test_alerts() -> dict:
         f"*Pinglet Alert Test*\n\nTimestamp: {timestamp}\nThis is a test message. If you see this, Slack alerts are working."
     )
 
-    # Test macOS
+    # Test macOS with log file opening
+    log_file = PROJECT_ROOT / "logs" / "pinglet.log"
     macos_ok = send_macos_notification(
         "Pinglet Test",
-        "If you see this, macOS alerts are working."
+        "Click Show to open log file.\n\nIf you see this, macOS alerts are working.",
+        open_file=str(log_file),
     )
 
     return {"slack": slack_ok, "macos": macos_ok}
