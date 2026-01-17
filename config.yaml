@@ -10,6 +10,17 @@ notifications:
   slack_enabled: true
   macos_enabled: true
 
+# Reliability system - reduces alert fatigue by handling transient failures
+reliability:
+  retry:
+    max_attempts: 3                 # Total attempts per run
+    delays_seconds: [10, 60, 300]   # 10s, 1min, 5min backoff
+    jitter: 0.25                    # ±25% randomization
+  alert:
+    consecutive_failures: 3         # Default: alert after 3 consecutive failures
+    cooldown_minutes: 30            # Don't re-alert within this period
+  notify_on_recovery: true          # Send "Recovered" notification
+
 healthcheck:
   enabled: true
   schedule_hour: 20                 # 8 PM (after UCE evening run)
@@ -28,6 +39,9 @@ tasks:
     timeout: 600                    # 10 minutes
     env:
       - SLACK_USER_TOKEN            # Pass through from parent env
+    reliability:
+      alert:
+        consecutive_failures: 3     # Runs 2x daily; 3 failures = 36hr worst case
 
   git-sync:
     name: Obsidian Git-Sync
@@ -37,6 +51,9 @@ tasks:
       - config.yaml
     working_dir: /path/to/git-sync
     timeout: 120                    # 2 minutes
+    reliability:
+      alert:
+        consecutive_failures: 5     # Hourly; git conflicts common; 5hr tolerance
 
   claude-backup:
     name: Claude Code Backup
@@ -49,6 +66,9 @@ tasks:
       - --auto
     working_dir: /path/to/claude-backup
     timeout: 300                    # 5 minutes
+    reliability:
+      alert:
+        consecutive_failures: 5     # Hourly; important but not urgent; 5hr tolerance
 
   # Future tasks can be added here:
   # home-repo:

@@ -22,8 +22,9 @@ import yaml
 PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from lib.alerts import send_critical, send_health_summary, test_alerts
+from lib.alerts import send_critical, send_recovery, send_health_summary, test_alerts
 from lib.logging import log, log_run_start, log_run_end, get_log_file_path
+from lib.reliability import ReliabilityConfig, ReliabilityManager
 from lib.state import (
     load_state,
     update_state_success,
@@ -45,13 +46,19 @@ def load_config() -> dict:
 
 def run_task(task_name: str) -> int:
     """
-    Run a registered task.
+    Run a registered task with reliability features.
+
+    Includes:
+    - Automatic retry with exponential backoff
+    - Consecutive failure threshold for alert gating
+    - Alert cooldown to prevent spam
+    - Recovery notifications
 
     Args:
         task_name: Name of the task from config.yaml
 
     Returns:
-        Exit code (0 for success, 1 for failure)
+        Exit code (0 for success, non-zero for failure)
     """
     config = load_config()
     tasks = config.get("tasks", {})
@@ -69,6 +76,13 @@ def run_task(task_name: str) -> int:
     timeout = task_config.get("timeout", 300)  # Default 5 minutes
     env_vars = task_config.get("env", [])
 
+    # Build reliability configuration (global defaults + task overrides)
+    reliability_config = ReliabilityConfig.from_config(
+        config.get("reliability", {}),
+        task_config.get("reliability", {}),
+    )
+    reliability = ReliabilityManager(task_name, reliability_config)
+
     # Build command list
     cmd = [command] + args
 
@@ -82,73 +96,87 @@ def run_task(task_name: str) -> int:
     log(f"Running: {' '.join(cmd)}", task_name)
     log(f"Working dir: {working_dir}", task_name)
     log(f"Timeout: {timeout}s", task_name)
+    log(f"Reliability: threshold={reliability_config.alert_threshold}, max_retries={reliability_config.max_retry_attempts}", task_name)
 
-    start_time = time.time()
-    exit_code = 0
-    error_message = ""
-    stdout_data = ""
-    stderr_data = ""
+    overall_start_time = time.time()
 
-    try:
-        result = subprocess.run(
-            cmd,
-            cwd=working_dir,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+    def execute_once() -> tuple:
+        """Execute the task once, returning (exit_code, stdout, stderr)."""
+        start_time = time.time()
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=working_dir,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            return result.returncode, result.stdout or "", result.stderr or ""
 
-        exit_code = result.returncode
-        stdout_data = result.stdout
-        stderr_data = result.stderr
+        except subprocess.TimeoutExpired as e:
+            log(f"TIMEOUT | Task timed out after {timeout} seconds", task_name)
+            return 124, e.stdout or "", e.stderr or ""
 
-        if stdout_data:
-            for line in stdout_data.strip().split("\n")[-20:]:  # Last 20 lines
-                log(f"STDOUT | {line}", task_name)
+        except Exception as e:
+            log(f"EXCEPTION | {str(e)}", task_name)
+            return 1, "", str(e)
 
-        if stderr_data:
-            for line in stderr_data.strip().split("\n")[-20:]:  # Last 20 lines
-                log(f"STDERR | {line}", task_name)
+    # Execute with automatic retry
+    success, exit_code, stdout_data, stderr_data = reliability.execute_with_retry(execute_once)
 
-        if exit_code != 0:
-            error_message = stderr_data or stdout_data or f"Exit code {exit_code}"
+    # Log output (last 20 lines)
+    if stdout_data:
+        for line in stdout_data.strip().split("\n")[-20:]:
+            log(f"STDOUT | {line}", task_name)
+    if stderr_data:
+        for line in stderr_data.strip().split("\n")[-20:]:
+            log(f"STDERR | {line}", task_name)
 
-    except subprocess.TimeoutExpired as e:
-        exit_code = 124  # Standard timeout exit code
-        error_message = f"Task timed out after {timeout} seconds"
-        stdout_data = e.stdout or ""
-        stderr_data = e.stderr or ""
-        log(f"TIMEOUT | {error_message}", task_name)
+    duration = time.time() - overall_start_time
+    error_message = stderr_data or stdout_data or f"Exit code {exit_code}"
 
-    except Exception as e:
-        exit_code = 1
-        error_message = str(e)
-        log(f"EXCEPTION | {error_message}", task_name)
+    # Update state and handle alerts
+    if success:
+        # Track previous failures for recovery notification
+        previous_failures = reliability.get_previous_failures()
 
-    duration = time.time() - start_time
-
-    # Update state and send alerts
-    if exit_code == 0:
         update_state_success(task_name, duration)
         log_run_end(task_name, "success", duration)
-        # Silent on success
+
+        # Check for recovery (success after failures)
+        if reliability.is_recovery():
+            log(f"RECOVERY | Task recovered after {previous_failures} consecutive failures", task_name)
+            send_recovery(
+                task_name=display_name,
+                previous_failures=previous_failures,
+                details={"Duration": f"{duration:.1f}s"},
+            )
     else:
         is_timeout = exit_code == 124
         update_state_failure(task_name, error_message, duration, timeout=is_timeout)
         log_run_end(task_name, "timeout" if is_timeout else "failed", duration, {"error": error_message[:50]})
 
-        # Send alerts
-        send_critical(
-            task_name=display_name,
-            error=error_message,
-            details={
-                "Exit code": exit_code,
-                "Duration": f"{duration:.1f}s",
-            },
-            log_file=str(get_log_file_path()),
-            task_id=task_name,
-        )
+        # Check if we should alert (threshold + cooldown)
+        should_alert, alert_reason = reliability.should_alert()
+        log(f"Alert decision: {should_alert} ({alert_reason})", task_name)
+
+        if should_alert:
+            # Reload state to get current consecutive_failures count
+            current_state = load_state(task_name)
+            send_critical(
+                task_name=display_name,
+                error=error_message,
+                details={
+                    "Exit code": exit_code,
+                    "Duration": f"{duration:.1f}s",
+                    "Consecutive failures": current_state.consecutive_failures,
+                    "Retry attempts": reliability_config.max_retry_attempts,
+                },
+                log_file=str(get_log_file_path()),
+                task_id=task_name,
+            )
+            reliability.record_alert_sent()
 
     return exit_code
 

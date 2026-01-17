@@ -170,6 +170,40 @@ def send_critical(task_name: str, error: str, details: dict = None, log_file: st
     print(f"ALERT | Critical alert sent for {task_name}: {error[:50]}...")
 
 
+def send_recovery(task_name: str, previous_failures: int, details: dict = None) -> None:
+    """
+    Send recovery notification when task succeeds after failures.
+
+    Args:
+        task_name: Name of the recovered task
+        previous_failures: Number of consecutive failures before recovery
+        details: Optional additional details
+    """
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    slack_message = f"""*Pinglet - Task Recovered*
+
+*Task:* {task_name}
+*Timestamp:* {timestamp}
+*Status:* RESOLVED
+
+Task has recovered after {previous_failures} consecutive failure(s).
+"""
+
+    if details:
+        slack_message += "\n*Details:*"
+        for key, value in details.items():
+            slack_message += f"\n• {key}: {value}"
+
+    send_slack_message(slack_message)
+    send_macos_notification(
+        f"Pinglet: {task_name} Recovered",
+        f"Task recovered after {previous_failures} failure(s)",
+    )
+
+    print(f"ALERT | Recovery notification sent for {task_name}")
+
+
 def send_warning(task_name: str, message: str, details: dict = None) -> None:
     """
     Send warning for degraded runs (partial success).

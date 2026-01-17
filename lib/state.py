@@ -29,13 +29,27 @@ class TaskState:
     runs_today: int = 0
     runs_today_date: Optional[str] = None  # YYYY-MM-DD to reset counter
 
+    # Reliability system fields
+    last_alert_time: Optional[str] = None  # ISO timestamp of last alert sent
+    alerts_sent_this_streak: int = 0  # Alerts sent for current failure streak
+    was_failing: bool = False  # True if previous run failed (for recovery detection)
+
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict) -> "TaskState":
-        """Create from dictionary."""
+        """Create from dictionary with backward-compatible defaults."""
+        # Handle new fields for existing state files
+        defaults = {
+            "last_alert_time": None,
+            "alerts_sent_this_streak": 0,
+            "was_failing": data.get("consecutive_failures", 0) > 0,  # Infer from existing
+        }
+        for key, default in defaults.items():
+            if key not in data:
+                data[key] = default
         return cls(**data)
 
 
@@ -104,6 +118,9 @@ def update_state_success(task_name: str, duration: float) -> TaskState:
     state = load_state(task_name)
     today = datetime.now().strftime("%Y-%m-%d")
 
+    # Track if we were failing (for recovery detection)
+    was_previously_failing = state.consecutive_failures > 0
+
     state.last_run = datetime.now().isoformat()
     state.last_status = "success"
     state.last_error = None
@@ -117,6 +134,10 @@ def update_state_success(task_name: str, duration: float) -> TaskState:
     else:
         state.runs_today = 1
         state.runs_today_date = today
+
+    # Reset alert tracking on success
+    state.alerts_sent_this_streak = 0
+    state.was_failing = was_previously_failing  # Store for recovery check
 
     save_state(state)
     return state
@@ -145,6 +166,7 @@ def update_state_failure(task_name: str, error: str, duration: float, timeout: b
     state.consecutive_failures += 1
     state.total_runs += 1
     state.total_failures += 1
+    state.was_failing = True  # Mark as currently failing
 
     # Update runs_today counter
     if state.runs_today_date == today:
