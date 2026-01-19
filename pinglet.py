@@ -7,9 +7,15 @@ Usage:
     pinglet.py --healthcheck          Run daily health summary
     pinglet.py --list                 List registered tasks
     pinglet.py --test-alerts          Test notification system
+    pinglet.py --run-now <task>       Run a missed task immediately
+    pinglet.py --ignore <task>        Mark a missed task as ignored
+    pinglet.py --heartbeat            Run heartbeat check for missed tasks
+    pinglet.py --install-heartbeat    Install heartbeat LaunchAgent
+    pinglet.py --uninstall-heartbeat  Uninstall heartbeat LaunchAgent
 """
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -22,7 +28,14 @@ import yaml
 PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from lib.alerts import send_critical, send_recovery, send_health_summary, test_alerts
+from lib.alerts import (
+    send_critical,
+    send_recovery,
+    send_health_summary,
+    send_macos_notification,
+    send_manual_complete_notification,
+    test_alerts,
+)
 from lib.logging import log, log_run_start, log_run_end, get_log_file_path
 from lib.reliability import ReliabilityConfig, ReliabilityManager
 from lib.state import (
@@ -31,6 +44,12 @@ from lib.state import (
     update_state_failure,
     load_all_states,
 )
+from lib.heartbeat import run_heartbeat as heartbeat_run, should_run_task
+from lib.ignored import ignore_task as mark_ignored, clear_ignored, is_ignored
+
+# Directories for LaunchAgents
+LAUNCHAGENTS_DIR = PROJECT_ROOT / "launchagents"
+USER_LAUNCHAGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
 
 
 def load_config() -> dict:
@@ -258,6 +277,240 @@ def run_healthcheck() -> int:
     return 0 if all_healthy else 1
 
 
+def run_now(task_name: str, config: dict = None) -> int:
+    """
+    Run a task immediately (used by notification actions).
+
+    Handles stale notification case where task already ran.
+
+    Args:
+        task_name: Name of the task to run
+        config: Optional config dict (loaded if not provided)
+
+    Returns:
+        Exit code (0 for success, non-zero for failure)
+    """
+    if config is None:
+        config = load_config()
+
+    tasks = config.get("tasks", {})
+    if task_name not in tasks:
+        print(f"ERROR: Unknown task '{task_name}'")
+        return 1
+
+    display_name = tasks[task_name].get("name", task_name)
+
+    # Check if task still qualifies as missed
+    should_run, reason = should_run_task(task_name, config)
+
+    if not should_run:
+        log(f"Task already ran, skipping: {reason}", task_name)
+        send_macos_notification(
+            f"Pinglet: {display_name}",
+            f"Task {reason}, skipping",
+        )
+        return 0
+
+    log(f"Running task manually: {task_name} ({reason})", task_name)
+
+    # Clear ignored status before running
+    clear_ignored(task_name)
+
+    # Run the task
+    exit_code = run_task(task_name)
+
+    # Send completion notification
+    send_manual_complete_notification(
+        task_name=task_name,
+        display_name=display_name,
+        success=exit_code == 0,
+        config=config,
+        error=None if exit_code == 0 else f"Exit code {exit_code}",
+    )
+
+    return exit_code
+
+
+def ignore_task(task_name: str, config: dict = None) -> int:
+    """
+    Mark a task as ignored (used by notification actions).
+
+    Args:
+        task_name: Name of the task to ignore
+        config: Optional config dict (loaded if not provided)
+
+    Returns:
+        Exit code (always 0)
+    """
+    if config is None:
+        config = load_config()
+
+    tasks = config.get("tasks", {})
+    expected_intervals = config.get("healthcheck", {}).get("expected_intervals", {})
+
+    if task_name not in tasks:
+        print(f"ERROR: Unknown task '{task_name}'")
+        return 1
+
+    display_name = tasks[task_name].get("name", task_name)
+    threshold = expected_intervals.get(task_name, 0)
+
+    # Get current state
+    state = load_state(task_name)
+    last_run = state.last_run or "Never"
+
+    # Calculate hours overdue
+    hours_overdue = 0.0
+    if state.last_run and threshold > 0:
+        try:
+            last_run_dt = datetime.fromisoformat(state.last_run)
+            hours_since = (datetime.now() - last_run_dt).total_seconds() / 3600
+            hours_overdue = max(0, hours_since - threshold)
+        except ValueError:
+            pass
+
+    # Mark as ignored
+    mark_ignored(
+        task_name=task_name,
+        last_run=last_run,
+        threshold=threshold,
+        hours_overdue=hours_overdue,
+    )
+
+    log(f"Manual skip: last_run {hours_overdue + threshold:.1f}h ago (threshold {threshold}h)", task_name)
+    print(f"Task '{display_name}' marked as ignored until next scheduled run.")
+
+    return 0
+
+
+def run_heartbeat_command(config: dict = None) -> int:
+    """
+    Run heartbeat check for missed tasks (used by LaunchAgent).
+
+    Args:
+        config: Optional config dict (loaded if not provided)
+
+    Returns:
+        Exit code (0 for no missed tasks, 1 for missed tasks found)
+    """
+    if config is None:
+        config = load_config()
+
+    result = heartbeat_run(config)
+
+    if result["missed_count"] > 0:
+        return 1
+    return 0
+
+
+def install_heartbeat() -> int:
+    """
+    Install heartbeat LaunchAgent.
+
+    Returns:
+        Exit code (0 for success, non-zero for failure)
+    """
+    LAUNCHAGENTS_DIR.mkdir(parents=True, exist_ok=True)
+    USER_LAUNCHAGENTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    plist_name = "com.pinglet.heartbeat.plist"
+    plist_path = LAUNCHAGENTS_DIR / plist_name
+    target_path = USER_LAUNCHAGENTS_DIR / plist_name
+
+    # Generate plist content
+    python_path = PROJECT_ROOT / "venv" / "bin" / "python"
+    script_path = PROJECT_ROOT / "pinglet.py"
+    log_path = PROJECT_ROOT / "logs" / "launchd-heartbeat.log"
+
+    plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.pinglet.heartbeat</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{python_path}</string>
+        <string>{script_path}</string>
+        <string>--heartbeat</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>{PROJECT_ROOT}</string>
+    <key>StartInterval</key>
+    <integer>3600</integer>
+    <key>StandardOutPath</key>
+    <string>{log_path}</string>
+    <key>StandardErrorPath</key>
+    <string>{log_path}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>
+"""
+
+    # Write plist file
+    plist_path.write_text(plist_content)
+    print(f"Generated plist: {plist_path}")
+
+    # Copy to LaunchAgents
+    shutil.copy(plist_path, target_path)
+    print(f"Installed to: {target_path}")
+
+    # Unload if already loaded (ignore errors)
+    subprocess.run(
+        ["launchctl", "unload", str(target_path)],
+        capture_output=True,
+    )
+
+    # Load the agent
+    result = subprocess.run(
+        ["launchctl", "load", str(target_path)],
+        capture_output=True,
+    )
+
+    if result.returncode == 0:
+        print("Heartbeat LaunchAgent installed and loaded successfully!")
+        return 0
+    else:
+        print(f"ERROR loading LaunchAgent: {result.stderr.decode()}")
+        return 1
+
+
+def uninstall_heartbeat() -> int:
+    """
+    Uninstall heartbeat LaunchAgent.
+
+    Returns:
+        Exit code (0 for success, non-zero for failure)
+    """
+    plist_name = "com.pinglet.heartbeat.plist"
+    target_path = USER_LAUNCHAGENTS_DIR / plist_name
+
+    if not target_path.exists():
+        print("Heartbeat LaunchAgent is not installed.")
+        return 0
+
+    # Unload the agent
+    result = subprocess.run(
+        ["launchctl", "unload", str(target_path)],
+        capture_output=True,
+    )
+
+    # Remove the plist file
+    target_path.unlink()
+    print(f"Removed: {target_path}")
+
+    if result.returncode == 0:
+        print("Heartbeat LaunchAgent uninstalled successfully!")
+    else:
+        print(f"Warning: unload returned error (may already be unloaded)")
+
+    return 0
+
+
 def list_tasks() -> None:
     """List all registered tasks."""
     config = load_config()
@@ -297,6 +550,13 @@ def main():
     parser.add_argument("--list", "-l", action="store_true", help="List registered tasks")
     parser.add_argument("--test-alerts", action="store_true", help="Test notification system")
 
+    # New commands from spec
+    parser.add_argument("--run-now", metavar="TASK", help="Run a missed task immediately")
+    parser.add_argument("--ignore", metavar="TASK", help="Mark a missed task as ignored")
+    parser.add_argument("--heartbeat", action="store_true", help="Run heartbeat check for missed tasks")
+    parser.add_argument("--install-heartbeat", action="store_true", help="Install heartbeat LaunchAgent")
+    parser.add_argument("--uninstall-heartbeat", action="store_true", help="Uninstall heartbeat LaunchAgent")
+
     args = parser.parse_args()
 
     if args.task:
@@ -311,6 +571,16 @@ def main():
         print(f"Slack: {'OK' if results['slack'] else 'FAILED'}")
         print(f"macOS: {'OK' if results['macos'] else 'FAILED'}")
         sys.exit(0 if all(results.values()) else 1)
+    elif args.run_now:
+        sys.exit(run_now(args.run_now))
+    elif args.ignore:
+        sys.exit(ignore_task(args.ignore))
+    elif args.heartbeat:
+        sys.exit(run_heartbeat_command())
+    elif args.install_heartbeat:
+        sys.exit(install_heartbeat())
+    elif args.uninstall_heartbeat:
+        sys.exit(uninstall_heartbeat())
     else:
         parser.print_help()
         sys.exit(1)

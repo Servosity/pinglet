@@ -297,6 +297,227 @@ def send_health_summary(tasks: list, healthy: bool = True) -> None:
         )
 
 
+def send_missed_task_notification(
+    task_name: str,
+    display_name: str,
+    hours_overdue: float,
+    threshold: int
+) -> bool:
+    """
+    Send macOS notification with Run/Ignore actions for a missed task.
+
+    Args:
+        task_name: Task identifier for commands
+        display_name: Human-readable task name
+        hours_overdue: Hours past threshold
+        threshold: Expected interval in hours
+
+    Returns:
+        True on success, False on failure
+    """
+    pinglet_path = PROJECT_ROOT / "venv" / "bin" / "python"
+    pinglet_script = PROJECT_ROOT / "pinglet.py"
+
+    # Build commands that open Terminal and execute
+    run_command = f'open -a Terminal "{pinglet_path} {pinglet_script} --run-now {task_name}"'
+    ignore_command = f'open -a Terminal "{pinglet_path} {pinglet_script} --ignore {task_name}"'
+
+    total_hours = hours_overdue + threshold
+    message = f"{display_name} last ran {total_hours:.1f}h ago (threshold: {threshold}h)"
+
+    try:
+        # Try terminal-notifier with actions
+        cmd = [
+            "terminal-notifier",
+            "-title", "Pinglet: Missed Task",
+            "-message", message,
+            "-actions", "Run,Ignore",
+            "-execute", run_command,
+            "-sound", "default",
+            "-timeout", "0",  # Don't auto-dismiss
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, timeout=5)
+
+        if result.returncode == 0:
+            print(f"ALERT | Missed task notification sent for {task_name}")
+            return True
+
+        # Fallback to AppleScript dialog with buttons
+        print(f"ALERT | terminal-notifier failed, trying AppleScript dialog")
+        return _send_missed_task_dialog(task_name, display_name, hours_overdue, threshold)
+
+    except FileNotFoundError:
+        print("ALERT | terminal-notifier not available, trying AppleScript")
+        return _send_missed_task_dialog(task_name, display_name, hours_overdue, threshold)
+    except Exception as e:
+        print(f"ALERT | Missed task notification error: {e}")
+        return False
+
+
+def _send_missed_task_dialog(
+    task_name: str,
+    display_name: str,
+    hours_overdue: float,
+    threshold: int
+) -> bool:
+    """
+    Send AppleScript dialog with Run/Ignore buttons as fallback.
+
+    Args:
+        task_name: Task identifier for commands
+        display_name: Human-readable task name
+        hours_overdue: Hours past threshold
+        threshold: Expected interval in hours
+
+    Returns:
+        True on success, False on failure
+    """
+    pinglet_path = PROJECT_ROOT / "venv" / "bin" / "python"
+    pinglet_script = PROJECT_ROOT / "pinglet.py"
+
+    total_hours = hours_overdue + threshold
+
+    script = f'''
+    set dialogResult to display dialog "Task '{display_name}' hasn't run in {total_hours:.1f} hours (threshold: {threshold}h)." ¬
+        buttons {{"Ignore", "Run Now"}} default button "Run Now" ¬
+        with title "Pinglet: Missed Task" ¬
+        giving up after 300
+
+    if button returned of dialogResult is "Run Now" then
+        do shell script "open -a Terminal \\"{pinglet_path} {pinglet_script} --run-now {task_name}\\""
+    else if button returned of dialogResult is "Ignore" then
+        do shell script "open -a Terminal \\"{pinglet_path} {pinglet_script} --ignore {task_name}\\""
+    end if
+    '''
+
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            timeout=310,  # Slightly longer than dialog timeout
+        )
+        return result.returncode == 0
+    except Exception as e:
+        print(f"ALERT | AppleScript dialog error: {e}")
+        return False
+
+
+def send_missed_task_slack(
+    task_name: str,
+    display_name: str,
+    hours_overdue: float,
+    threshold: int,
+    last_run: str
+) -> bool:
+    """
+    Send Slack notification for a missed task (informational only).
+
+    Args:
+        task_name: Task identifier
+        display_name: Human-readable task name
+        hours_overdue: Hours past threshold
+        threshold: Expected interval in hours
+        last_run: Last run timestamp string
+
+    Returns:
+        True on success, False on failure
+    """
+    total_hours = hours_overdue + threshold
+
+    message = f"""*Pinglet: Missed Task*
+`{task_name}` hasn't run in {total_hours:.1f} hours (threshold: {threshold}h)
+Last successful run: {last_run}
+
+_Use macOS notification to Run or Ignore_"""
+
+    return send_slack_message(message)
+
+
+def send_success_notification(
+    task_name: str,
+    display_name: str,
+    summary: str,
+    config: dict
+) -> bool:
+    """
+    Send silent success notification (notification center only, no sound/banner).
+
+    Args:
+        task_name: Task identifier
+        display_name: Human-readable task name
+        summary: Formatted output summary
+        config: Full configuration dictionary
+
+    Returns:
+        True on success, False on failure
+    """
+    if not config.get("notifications", {}).get("on_success", False):
+        return True  # Success notifications disabled
+
+    # Silent notification (no sound)
+    message = f"{display_name} completed\n{summary}" if summary else f"{display_name} completed"
+
+    try:
+        # Use terminal-notifier without sound for silent notification
+        cmd = [
+            "terminal-notifier",
+            "-title", "Pinglet",
+            "-message", message[:200],
+            # No -sound flag = silent
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, timeout=5)
+        return result.returncode == 0
+    except Exception as e:
+        print(f"ALERT | Success notification error: {e}")
+        return False
+
+
+def send_manual_complete_notification(
+    task_name: str,
+    display_name: str,
+    success: bool,
+    config: dict,
+    error: str = None
+) -> bool:
+    """
+    Send silent notification for manual run completion.
+
+    Args:
+        task_name: Task identifier
+        display_name: Human-readable task name
+        success: Whether the task succeeded
+        config: Full configuration dictionary
+        error: Error message if failed
+
+    Returns:
+        True on success, False on failure
+    """
+    if success:
+        message = f"{display_name} completed successfully"
+    else:
+        short_error = error[:50] if error else "Unknown error"
+        message = f"{display_name} failed: {short_error}"
+
+    try:
+        cmd = [
+            "terminal-notifier",
+            "-title", "Pinglet",
+            "-message", message,
+            # No -sound flag = silent for success, add sound for failure
+        ]
+
+        if not success:
+            cmd.extend(["-sound", "default"])
+
+        result = subprocess.run(cmd, capture_output=True, timeout=5)
+        return result.returncode == 0
+    except Exception as e:
+        print(f"ALERT | Manual complete notification error: {e}")
+        return False
+
+
 def test_alerts() -> dict:
     """
     Test the notification system.
