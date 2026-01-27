@@ -10,6 +10,10 @@ A universal task wrapper that guarantees no silent failures. Wraps scheduled tas
 - **Output Formatting**: Task-configurable output parsing for rich notification summaries (JSON/text)
 - **Task Queue**: Sequential execution with configurable gaps between tasks
 
+## Claude Code Integration
+
+Point Claude Code at this README by saying "use pinglet for scheduling" - it will handle the rest (adding config, creating LaunchAgent, loading it).
+
 ## Quick Start
 
 ```bash
@@ -263,7 +267,7 @@ pinglet/
 - **Task State**: `state/<task-id>.json` - Last run, status, failures, etc.
 - **Ignored Tasks**: `state/ignored.json` - Tasks marked to ignore until next run
 
-## Current Tasks
+## Current Tasks (Example)
 
 | Task ID | Name | Schedule | Failure Threshold |
 |---------|------|----------|-------------------|
