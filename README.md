@@ -1,6 +1,8 @@
-# Pinglet
+<p align="center">
+  <img src="assets/pinglet-logo-readme.png" alt="Pinglet - No silent failures" width="500">
+</p>
 
-> **This repository has moved to [github.com/servosity/pinglet](https://github.com/servosity/pinglet)**
+# Pinglet
 
 A universal task wrapper that guarantees no silent failures. Wraps scheduled tasks with unified logging, state tracking, and alerts (Slack + macOS).
 

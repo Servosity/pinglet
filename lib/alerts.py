@@ -16,6 +16,9 @@ load_dotenv(PROJECT_ROOT / ".env")
 SLACK_USER_TOKEN = os.environ.get("SLACK_USER_TOKEN", "")
 DEFAULT_SLACK_CHANNEL = os.environ.get("SLACK_DEFAULT_CHANNEL", "")
 
+# Notification icon
+NOTIFICATION_ICON = PROJECT_ROOT / "assets" / "pinglet-icon-512.png"
+
 
 def get_client() -> WebClient:
     """Get Slack WebClient with user token."""
@@ -74,6 +77,10 @@ def send_macos_notification(title: str, message: str, sound: str = "default", op
     try:
         # Try terminal-notifier first (more reliable, has its own notification permissions)
         cmd = ["terminal-notifier", "-title", title, "-message", message, "-sound", sound]
+
+        # Add custom app icon if it exists
+        if NOTIFICATION_ICON.exists():
+            cmd.extend(["-appIcon", str(NOTIFICATION_ICON)])
 
         # Add action to open file when clicking "Show"
         if open_file:
@@ -337,6 +344,10 @@ def send_missed_task_notification(
             "-timeout", "0",  # Don't auto-dismiss
         ]
 
+        # Add custom app icon if it exists
+        if NOTIFICATION_ICON.exists():
+            cmd.extend(["-appIcon", str(NOTIFICATION_ICON)])
+
         result = subprocess.run(cmd, capture_output=True, timeout=5)
 
         if result.returncode == 0:
@@ -467,6 +478,10 @@ def send_success_notification(
             # No -sound flag = silent
         ]
 
+        # Add custom app icon if it exists
+        if NOTIFICATION_ICON.exists():
+            cmd.extend(["-appIcon", str(NOTIFICATION_ICON)])
+
         result = subprocess.run(cmd, capture_output=True, timeout=5)
         return result.returncode == 0
     except Exception as e:
@@ -507,6 +522,10 @@ def send_manual_complete_notification(
             "-message", message,
             # No -sound flag = silent for success, add sound for failure
         ]
+
+        # Add custom app icon if it exists
+        if NOTIFICATION_ICON.exists():
+            cmd.extend(["-appIcon", str(NOTIFICATION_ICON)])
 
         if not success:
             cmd.extend(["-sound", "default"])
