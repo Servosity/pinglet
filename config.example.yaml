@@ -1,0 +1,72 @@
+# Pinglet Configuration
+# Copy this file to config.yaml and customize for your setup
+
+slack:
+  token_env: SLACK_USER_TOKEN       # Environment variable name
+  default_channel: DXXXXXXXXXX      # Your Slack DM channel ID
+
+notifications:
+  on_success: false                 # Silent on success
+  on_failure: true                  # Always alert on failure
+  slack_enabled: true
+  macos_enabled: true
+  success_silent: true              # Success notifications are silent (no sound/banner)
+  manual_complete_silent: true      # Manual run completion notifications are silent
+
+# Reliability system - reduces alert fatigue by handling transient failures
+reliability:
+  retry:
+    max_attempts: 3                 # Total attempts per run
+    delays_seconds: [10, 60, 300]   # 10s, 1min, 5min backoff
+    jitter: 0.25                    # +/-25% randomization
+  alert:
+    consecutive_failures: 3         # Default: alert after 3 consecutive failures
+    cooldown_minutes: 30            # Don't re-alert within this period
+  notify_on_recovery: true          # Send "Recovered" notification
+
+# Heartbeat system - detects missed tasks
+heartbeat:
+  enabled: true
+  interval_minutes: 60              # How often heartbeat runs (LaunchAgent)
+  wake_delay_seconds: 30            # Delay before notifying after detecting gaps
+
+healthcheck:
+  enabled: true
+  schedule_hour: 20                 # 8 PM
+  expected_intervals:               # Hours - alert if task hasn't run
+    my-task: 2                      # Example: alert if not run within 2 hours
+
+# Task definitions
+# Each task needs: command, working_dir, and optionally args, timeout, env, output, reliability
+tasks:
+  # Example task with basic configuration
+  my-task:
+    name: My Task Name              # Display name for notifications
+    command: /path/to/venv/bin/python
+    args:
+      - script.py
+      - --flag
+    working_dir: /path/to/project
+    timeout: 300                    # 5 minutes
+    env:
+      - SOME_ENV_VAR                # Pass through from parent environment
+    output:
+      format: text                  # "text" or "json"
+    reliability:
+      alert:
+        consecutive_failures: 3     # Override global default
+
+  # Example task with JSON output formatting
+  json-output-task:
+    name: JSON Output Example
+    command: /path/to/venv/bin/python
+    args:
+      - script.py
+    working_dir: /path/to/project
+    timeout: 300
+    output:
+      format: json
+      summary_template: "Processed {count} items, {errors} errors"
+    reliability:
+      alert:
+        consecutive_failures: 2

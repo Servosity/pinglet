@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    Example LaunchAgent for Pinglet
+
+    Copy this file and customize:
+    1. Replace YOUR_USERNAME with your macOS username
+    2. Replace TASK_NAME with your task ID from config.yaml
+    3. Adjust the schedule (StartInterval or StartCalendarInterval)
+    4. Save to ~/Library/LaunchAgents/com.pinglet.your-task.plist
+    5. Load with: launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pinglet.your-task.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.pinglet.TASK_NAME</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/YOUR_USERNAME/path/to/pinglet/venv/bin/python</string>
+        <string>/Users/YOUR_USERNAME/path/to/pinglet/pinglet.py</string>
+        <string>--task</string>
+        <string>TASK_NAME</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/YOUR_USERNAME/path/to/pinglet</string>
+
+    <!-- Option 1: Run at fixed interval (seconds) -->
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <!-- Option 2: Run at specific times (uncomment and remove StartInterval above)
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Hour</key>
+            <integer>7</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>19</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+    </array>
+    -->
+
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR_USERNAME/path/to/pinglet/logs/launchd-TASK_NAME.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_USERNAME/path/to/pinglet/logs/launchd-TASK_NAME.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

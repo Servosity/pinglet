@@ -11,11 +11,24 @@ build/
 # Environment
 .env
 
+# Configuration (use config.example.yaml as template)
+config.yaml
+
 # State files (local only)
 state/*.json
 
 # Logs
-logs/*.log
+logs/
+
+# Tasks (local scripts)
+tasks/
+
+# LaunchAgents (personal configs - use example.plist as template)
+launchagents/*.plist
+!launchagents/com.pinglet.example.plist
+
+# Claude Code local settings
+.claude/
 
 # macOS
 .DS_Store

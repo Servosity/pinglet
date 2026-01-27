@@ -12,9 +12,9 @@ from slack_sdk.errors import SlackApiError
 PROJECT_ROOT = Path(__file__).parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
 
-# Configuration
+# Configuration (loaded from environment)
 SLACK_USER_TOKEN = os.environ.get("SLACK_USER_TOKEN", "")
-DEFAULT_SLACK_CHANNEL = "DXXXXXXXXXX"  # Damien's DM
+DEFAULT_SLACK_CHANNEL = os.environ.get("SLACK_DEFAULT_CHANNEL", "")
 
 
 def get_client() -> WebClient:

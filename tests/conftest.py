@@ -41,7 +41,7 @@ def sample_config():
     return {
         "slack": {
             "token_env": "SLACK_USER_TOKEN",
-            "default_channel": "DXXXXXXXXXX",
+            "default_channel": "DXXXXXXXXXX",  # Placeholder for tests
         },
         "notifications": {
             "on_success": False,
