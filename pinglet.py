@@ -2,18 +2,10 @@
 """
 Pinglet - Universal task wrapper that guarantees no silent failures.
 
-Usage:
-    pinglet.py --task <task_name>     Run a registered task
-    pinglet.py --healthcheck          Run daily health summary
-    pinglet.py --list                 List registered tasks
-    pinglet.py --test-alerts          Test notification system
-    pinglet.py --run-now <task>       Run a missed task immediately
-    pinglet.py --ignore <task>        Mark a missed task as ignored
-    pinglet.py --heartbeat            Run heartbeat check for missed tasks
-    pinglet.py --install-heartbeat    Install heartbeat LaunchAgent
-    pinglet.py --uninstall-heartbeat  Uninstall heartbeat LaunchAgent
+Run with --help or no arguments for full agent-friendly reference.
 """
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -511,8 +503,13 @@ def uninstall_heartbeat() -> int:
     return 0
 
 
-def list_tasks() -> None:
+def list_tasks(json_mode: bool = False) -> None:
     """List all registered tasks."""
+    if json_mode:
+        from lib.task_manager import list_tasks_json
+        print(json.dumps(list_tasks_json(), indent=2))
+        return
+
     config = load_config()
     tasks = config.get("tasks", {})
 
@@ -541,30 +538,299 @@ def list_tasks() -> None:
     print()
 
 
+# =============================================================================
+# Task Management CLI Handlers
+# =============================================================================
+
+def _build_task_config_from_args(args) -> dict:
+    """Build a task config dict from CLI arguments."""
+    config = {}
+    if args.name:
+        config["name"] = args.name
+    if args.command:
+        config["command"] = args.command
+    if args.task_args:
+        config["args"] = args.task_args
+    if args.working_dir:
+        config["working_dir"] = args.working_dir
+    if args.timeout is not None:
+        config["timeout"] = args.timeout
+    if args.env:
+        config["env"] = args.env
+    if args.output_format or args.summary_template:
+        config["output"] = {}
+        if args.output_format:
+            config["output"]["format"] = args.output_format
+        if args.summary_template:
+            config["output"]["summary_template"] = args.summary_template
+    if args.failures_before_alert is not None:
+        config["reliability"] = {"alert": {"consecutive_failures": args.failures_before_alert}}
+    # Inline schedule
+    if args.schedule_spec:
+        config["schedule"] = args.schedule_spec
+    return config
+
+
+def handle_task_add(args) -> int:
+    from lib.task_manager import add_task
+    task_config = _build_task_config_from_args(args)
+
+    if args.dry_run:
+        print(json.dumps({"ok": True, "dry_run": True, "task_id": args.task_add, "config": task_config}, indent=2))
+        return 0
+
+    result = add_task(args.task_add, task_config)
+    print(json.dumps(result, indent=2))
+    return 0 if result["ok"] else (2 if "already exists" in result.get("error", "") else 1)
+
+
+def handle_task_edit(args) -> int:
+    from lib.task_manager import edit_task
+    updates = _build_task_config_from_args(args)
+
+    if not updates:
+        print(json.dumps({"ok": False, "error": "No fields to update. Use --name, --command, --timeout, etc."}))
+        return 2
+
+    if args.dry_run:
+        print(json.dumps({"ok": True, "dry_run": True, "task_id": args.task_edit, "updates": updates}, indent=2))
+        return 0
+
+    result = edit_task(args.task_edit, updates)
+    print(json.dumps(result, indent=2))
+    return 0 if result["ok"] else 1
+
+
+def handle_task_remove(args) -> int:
+    from lib.task_manager import remove_task
+
+    if args.dry_run:
+        print(json.dumps({"ok": True, "dry_run": True, "task_id": args.task_remove, "action": "would remove task + disable LaunchAgent if active"}))
+        return 0
+
+    result = remove_task(args.task_remove)
+    print(json.dumps(result, indent=2))
+    return 0 if result["ok"] else 1
+
+
+def handle_task_show(args) -> int:
+    from lib.task_manager import show_task
+    result = show_task(args.task_show)
+    print(json.dumps(result, indent=2))
+    return 0 if result["ok"] else 1
+
+
+def handle_task_logs(args) -> int:
+    from lib.task_manager import get_task_logs
+    task_id = args.task_logs[0]
+    lines = int(args.task_logs[1]) if len(args.task_logs) > 1 else 50
+    result = get_task_logs(task_id, lines)
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def handle_task_enable(args) -> int:
+    from lib.task_manager import enable_task
+
+    if args.dry_run:
+        print(json.dumps({"ok": True, "dry_run": True, "task_id": args.task_enable, "action": "would generate plist + load LaunchAgent"}))
+        return 0
+
+    result = enable_task(args.task_enable)
+    print(json.dumps(result, indent=2))
+    return 0 if result["ok"] else 1
+
+
+def handle_task_disable(args) -> int:
+    from lib.task_manager import disable_task
+
+    if args.dry_run:
+        print(json.dumps({"ok": True, "dry_run": True, "task_id": args.task_disable, "action": "would unload LaunchAgent + remove plist"}))
+        return 0
+
+    result = disable_task(args.task_disable)
+    print(json.dumps(result, indent=2))
+    return 0 if result["ok"] else 1
+
+
+def handle_schedule(args) -> int:
+    from lib.task_manager import set_schedule
+    task_id, spec = args.schedule
+
+    if args.dry_run:
+        from lib.task_manager import parse_schedule, schedule_to_human
+        try:
+            parsed = parse_schedule(spec)
+            print(json.dumps({"ok": True, "dry_run": True, "task_id": task_id, "schedule": spec, "parsed": schedule_to_human(parsed)}))
+        except ValueError as e:
+            print(json.dumps({"ok": False, "error": str(e)}))
+            return 2
+        return 0
+
+    result = set_schedule(task_id, spec)
+    print(json.dumps(result, indent=2))
+    return 0 if result["ok"] else 1
+
+
+# =============================================================================
+# Agent-Friendly Help
+# =============================================================================
+
+HELP_TEXT = """Pinglet Task Manager — No silent failures
+
+TASK MANAGEMENT:
+  --task-add ID              Add task (requires --command)
+  --task-edit ID             Edit task (only specified fields update)
+  --task-remove ID           Remove task (auto-disables if scheduled)
+  --task-show ID             Full task details + state + recent logs (JSON)
+  --task-logs ID [N]         Last N lines of task logs (default: 50)
+  --task-enable ID           Generate plist + load LaunchAgent
+  --task-disable ID          Unload LaunchAgent + remove plist
+  --list [--json]            List all tasks (--json for structured output)
+  --schedule ID SPEC         Set task schedule (see syntax below)
+  --dry-run                  Preview changes without modifying
+
+TASK EXECUTION:
+  --task ID, -t ID           Run a registered task now
+  --run-now TASK             Run a missed task immediately
+  --ignore TASK              Mark missed task as ignored
+  --healthcheck, -H          Run daily health summary
+  --heartbeat                Check for missed tasks
+  --test-alerts              Test Slack + macOS notifications
+  --install-heartbeat        Install heartbeat LaunchAgent
+  --uninstall-heartbeat      Uninstall heartbeat LaunchAgent
+
+TASK CONFIG FLAGS (use with --task-add or --task-edit):
+  --command PATH             Executable path (required for add)
+  --name TEXT                Display name (default: title-cased task ID)
+  --args ARG [ARG ...]       Command arguments
+  --working-dir PATH         Working directory
+  --timeout SECS             Timeout in seconds (default: 300)
+  --env VAR [VAR ...]        Env vars to pass through
+  --output-format text|json  Task output format (default: text)
+  --summary-template TEXT    Template for JSON output (e.g. "Processed {count} items")
+  --failures-before-alert N  Consecutive failures before alerting (default: 3)
+  --schedule-spec SPEC       Schedule (inline with add/edit, see syntax below)
+
+SCHEDULE SYNTAX:
+  every 1h                   Every hour (StartInterval)
+  every 30m                  Every 30 minutes
+  every 3600s                Every 3600 seconds
+  daily 7:00                 Daily at 7:00 AM
+  daily 7:00,19:00           Daily at 7 AM and 7 PM
+  weekly mon 7:33            Weekly on Monday at 7:33 AM
+
+OUTPUT:
+  All management commands output JSON to stdout.
+  Success: {"ok": true, "task_id": "...", ...}
+  Error:   {"ok": false, "error": "..."}
+  Exit codes: 0=success, 1=error, 2=validation error
+
+EXAMPLES:
+  # Add a task with schedule
+  pinglet.py --task-add my-task --command /usr/bin/python3 --args script.py --schedule-spec "daily 7:00"
+
+  # Enable scheduling (generates plist + loads LaunchAgent)
+  pinglet.py --task-enable my-task
+
+  # Show full task details including logs
+  pinglet.py --task-show my-task
+
+  # View recent task logs
+  pinglet.py --task-logs my-task 100
+
+  # Edit timeout and reschedule
+  pinglet.py --task-edit my-task --timeout 600
+  pinglet.py --schedule my-task "every 2h"
+  pinglet.py --task-enable my-task
+
+  # List all tasks as JSON
+  pinglet.py --list --json
+
+  # Remove task (auto-disables)
+  pinglet.py --task-remove my-task
+
+  # Dry-run any mutating command
+  pinglet.py --task-add test --command /usr/bin/echo --dry-run
+"""
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Pinglet - Universal task wrapper that guarantees no silent failures"
+        description="Pinglet - Universal task wrapper that guarantees no silent failures",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=HELP_TEXT,
+        add_help=False,
     )
+
+    # Existing commands
+    parser.add_argument("--help", "-h", action="store_true", help="Show help")
     parser.add_argument("--task", "-t", help="Run a registered task")
     parser.add_argument("--healthcheck", "-H", action="store_true", help="Run daily health summary")
     parser.add_argument("--list", "-l", action="store_true", help="List registered tasks")
     parser.add_argument("--test-alerts", action="store_true", help="Test notification system")
-
-    # New commands from spec
     parser.add_argument("--run-now", metavar="TASK", help="Run a missed task immediately")
     parser.add_argument("--ignore", metavar="TASK", help="Mark a missed task as ignored")
     parser.add_argument("--heartbeat", action="store_true", help="Run heartbeat check for missed tasks")
     parser.add_argument("--install-heartbeat", action="store_true", help="Install heartbeat LaunchAgent")
     parser.add_argument("--uninstall-heartbeat", action="store_true", help="Uninstall heartbeat LaunchAgent")
 
+    # Task management commands
+    parser.add_argument("--task-add", metavar="ID", help="Add a new task")
+    parser.add_argument("--task-edit", metavar="ID", help="Edit an existing task")
+    parser.add_argument("--task-remove", metavar="ID", help="Remove a task")
+    parser.add_argument("--task-show", metavar="ID", help="Show task details (JSON)")
+    parser.add_argument("--task-logs", nargs="+", metavar="ARG", help="Show task logs: ID [LINES]")
+    parser.add_argument("--task-enable", metavar="ID", help="Enable task scheduling")
+    parser.add_argument("--task-disable", metavar="ID", help="Disable task scheduling")
+    parser.add_argument("--schedule", nargs=2, metavar=("ID", "SPEC"), help="Set task schedule")
+    parser.add_argument("--json", action="store_true", help="JSON output (with --list)")
+    parser.add_argument("--dry-run", action="store_true", help="Preview changes")
+
+    # Task config flags (for --task-add and --task-edit)
+    parser.add_argument("--name", help="Task display name")
+    parser.add_argument("--command", help="Command to execute")
+    parser.add_argument("--args", nargs="*", dest="task_args", help="Command arguments")
+    parser.add_argument("--working-dir", help="Working directory")
+    parser.add_argument("--timeout", type=int, help="Timeout in seconds")
+    parser.add_argument("--env", nargs="*", help="Environment variables to pass through")
+    parser.add_argument("--output-format", choices=["text", "json"], help="Output format")
+    parser.add_argument("--summary-template", help="Template for JSON output")
+    parser.add_argument("--failures-before-alert", type=int, help="Failures before alert")
+    parser.add_argument("--schedule-spec", help="Schedule spec (inline with add/edit)")
+
     args = parser.parse_args()
 
-    if args.task:
+    # Help / no args
+    if args.help or len(sys.argv) == 1:
+        print(HELP_TEXT)
+        sys.exit(0)
+
+    # Task management dispatch (before existing commands)
+    if args.task_add:
+        sys.exit(handle_task_add(args))
+    elif args.task_edit:
+        sys.exit(handle_task_edit(args))
+    elif args.task_remove:
+        sys.exit(handle_task_remove(args))
+    elif args.task_show:
+        sys.exit(handle_task_show(args))
+    elif args.task_logs:
+        sys.exit(handle_task_logs(args))
+    elif args.task_enable:
+        sys.exit(handle_task_enable(args))
+    elif args.task_disable:
+        sys.exit(handle_task_disable(args))
+    elif args.schedule:
+        sys.exit(handle_schedule(args))
+
+    # Existing commands
+    elif args.task:
         sys.exit(run_task(args.task))
     elif args.healthcheck:
         sys.exit(run_healthcheck())
     elif args.list:
-        list_tasks()
+        list_tasks(json_mode=args.json)
     elif args.test_alerts:
         print("Testing alerts...")
         results = test_alerts()
@@ -582,7 +848,7 @@ def main():
     elif args.uninstall_heartbeat:
         sys.exit(uninstall_heartbeat())
     else:
-        parser.print_help()
+        print(HELP_TEXT)
         sys.exit(1)
 
 
