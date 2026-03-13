@@ -208,10 +208,24 @@ def validate_task_config(task_config: dict, task_id: str, existing_tasks: dict) 
 # =============================================================================
 
 def generate_plist(task_id: str, schedule_dict: dict) -> str:
-    """Generate plist XML for a task's LaunchAgent."""
+    """Generate plist XML for a task's LaunchAgent.
+
+    KeepAlive is only added for StartInterval schedules (periodic tasks).
+    StartCalendarInterval + KeepAlive causes launchd config error (exit 78).
+    """
     python_path = str(PROJECT_ROOT / "venv" / "bin" / "python")
     project_root = str(PROJECT_ROOT)
     schedule_xml = _render_schedule_xml(schedule_dict)
+
+    # Only add KeepAlive for interval-based schedules, not calendar-based
+    keepalive_xml = ""
+    if "StartInterval" in schedule_dict:
+        keepalive_xml = """    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+"""
 
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -238,12 +252,7 @@ def generate_plist(task_id: str, schedule_dict: dict) -> str:
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
-    <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
-</dict>
+{keepalive_xml}</dict>
 </plist>
 """
 
