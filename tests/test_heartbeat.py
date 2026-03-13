@@ -318,3 +318,106 @@ class TestEscalationLevels:
         """Zero threshold should default to warning."""
         from lib.heartbeat import get_escalation_level
         assert get_escalation_level(100, 0) == "warning"
+
+
+class TestHeartbeatAlertCooldown:
+    """Tests for per-task Slack alert cooldown."""
+
+    def test_should_alert_first_time(self):
+        """First alert for a task should always fire."""
+        from lib.heartbeat import _should_alert_for_task
+        assert _should_alert_for_task("uce", "warning", {}) is True
+
+    def test_should_not_alert_within_cooldown(self):
+        """Same task+escalation within 24h should be suppressed."""
+        from lib.heartbeat import _should_alert_for_task
+        recent = datetime.now() - timedelta(hours=1)
+        state = {"uce": {"last_alert": recent.isoformat(), "escalation": "warning"}}
+        assert _should_alert_for_task("uce", "warning", state) is False
+
+    def test_should_alert_after_cooldown_expires(self):
+        """Same task after 24h+ should re-alert."""
+        from lib.heartbeat import _should_alert_for_task
+        old = datetime.now() - timedelta(hours=25)
+        state = {"uce": {"last_alert": old.isoformat(), "escalation": "warning"}}
+        assert _should_alert_for_task("uce", "warning", state) is True
+
+    def test_should_alert_on_escalation_change(self):
+        """Escalation level change should bypass cooldown."""
+        from lib.heartbeat import _should_alert_for_task
+        recent = datetime.now() - timedelta(hours=1)
+        state = {"uce": {"last_alert": recent.isoformat(), "escalation": "warning"}}
+        assert _should_alert_for_task("uce", "urgent", state) is True
+
+    def test_different_task_not_affected(self):
+        """Cooldown for one task shouldn't affect another."""
+        from lib.heartbeat import _should_alert_for_task
+        recent = datetime.now() - timedelta(hours=1)
+        state = {"uce": {"last_alert": recent.isoformat(), "escalation": "warning"}}
+        assert _should_alert_for_task("claude-backup", "warning", state) is True
+
+    def test_corrupted_state_allows_alert(self):
+        """Corrupted alert state should allow alerting."""
+        from lib.heartbeat import _should_alert_for_task
+        state = {"uce": {"last_alert": "not-a-date", "escalation": "warning"}}
+        assert _should_alert_for_task("uce", "warning", state) is True
+
+    def test_run_heartbeat_respects_cooldown(self, sample_config):
+        """run_heartbeat should not send Slack for tasks within cooldown."""
+        old_time = datetime.now() - timedelta(hours=20)
+        recent_alert = datetime.now() - timedelta(hours=1)
+
+        mock_state = MockTaskState(
+            task_name="uce",
+            last_run=old_time.isoformat(),
+        )
+
+        # Pre-populate cooldown state for ALL tasks in sample_config
+        cooldown_state = {
+            "uce": {"last_alert": recent_alert.isoformat(), "escalation": "warning"},
+            "git-sync": {"last_alert": recent_alert.isoformat(), "escalation": "critical"},
+            "claude-backup": {"last_alert": recent_alert.isoformat(), "escalation": "critical"},
+        }
+
+        with patch("lib.heartbeat._load_state", return_value=mock_state), \
+             patch("lib.heartbeat._is_ignored", return_value=False), \
+             patch("lib.heartbeat._send_missed_task_notification"), \
+             patch("lib.heartbeat._send_slack_message") as mock_slack, \
+             patch("lib.heartbeat._load_heartbeat_alert_state", return_value=cooldown_state), \
+             patch("lib.heartbeat._save_heartbeat_alert_state"), \
+             patch("lib.heartbeat.detect_disabled_agents", return_value=[]):
+            from lib.heartbeat import run_heartbeat
+
+            result = run_heartbeat(sample_config, wake_delay=0)
+
+            assert result["missed_count"] >= 1
+            # Slack should NOT have been called (all tasks in cooldown)
+            mock_slack.assert_not_called()
+
+    def test_run_heartbeat_sends_after_cooldown(self, sample_config):
+        """run_heartbeat should send Slack after cooldown expires."""
+        old_time = datetime.now() - timedelta(hours=20)
+        old_alert = datetime.now() - timedelta(hours=25)
+
+        mock_state = MockTaskState(
+            task_name="uce",
+            last_run=old_time.isoformat(),
+        )
+
+        # Pre-populate expired cooldown state
+        cooldown_state = {"uce": {"last_alert": old_alert.isoformat(), "escalation": "warning"}}
+
+        with patch("lib.heartbeat._load_state", return_value=mock_state), \
+             patch("lib.heartbeat._is_ignored", return_value=False), \
+             patch("lib.heartbeat._send_missed_task_notification"), \
+             patch("lib.heartbeat._send_slack_message") as mock_slack, \
+             patch("lib.heartbeat._load_heartbeat_alert_state", return_value=cooldown_state), \
+             patch("lib.heartbeat._save_heartbeat_alert_state"), \
+             patch("lib.heartbeat.detect_disabled_agents", return_value=[]):
+            from lib.heartbeat import run_heartbeat
+
+            result = run_heartbeat(sample_config, wake_delay=0)
+
+            assert result["missed_count"] >= 1
+            # Slack SHOULD have been called (cooldown expired)
+            mock_slack.assert_called()

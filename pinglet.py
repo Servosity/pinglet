@@ -478,8 +478,6 @@ def install_heartbeat() -> int:
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
-    <key>KeepAlive</key>
-    <true/>
 </dict>
 </plist>
 """

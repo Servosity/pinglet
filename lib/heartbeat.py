@@ -51,6 +51,59 @@ def _get_launchd_status(task_id: str) -> dict:
     return get_launchd_status(task_id)
 
 
+HEARTBEAT_ALERT_FILE = state_module.STATE_DIR / "_heartbeat_alerts.json"
+ALERT_COOLDOWN_HOURS = 24
+
+
+def _load_heartbeat_alert_state() -> dict:
+    """Load per-task heartbeat alert state from disk."""
+    if HEARTBEAT_ALERT_FILE.exists():
+        try:
+            with open(HEARTBEAT_ALERT_FILE, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return {}
+
+
+def _save_heartbeat_alert_state(state: dict) -> None:
+    """Save per-task heartbeat alert state to disk."""
+    state_module.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(HEARTBEAT_ALERT_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def _should_alert_for_task(task_name: str, escalation: str, alert_state: dict) -> bool:
+    """Check if we should send a Slack alert for this task.
+
+    Only re-alerts after ALERT_COOLDOWN_HOURS or if escalation level changed.
+
+    Args:
+        task_name: Task identifier
+        escalation: Current escalation level (warning/urgent/critical)
+        alert_state: Current alert state dict
+
+    Returns:
+        True if alert should be sent
+    """
+    prev = alert_state.get(task_name)
+    if not prev:
+        return True
+
+    try:
+        prev_time = datetime.fromisoformat(prev.get("last_alert", "2000-01-01"))
+        hours_since = (datetime.now() - prev_time).total_seconds() / 3600
+
+        # Re-alert if cooldown expired or escalation level increased
+        if hours_since >= ALERT_COOLDOWN_HOURS:
+            return True
+        if prev.get("escalation") != escalation:
+            return True
+        return False
+    except (ValueError, TypeError):
+        return True
+
+
 def detect_disabled_agents(config: dict) -> List[Dict]:
     """Detect LaunchAgents that are disabled by launchd (exit code 78).
 
@@ -248,6 +301,9 @@ def run_heartbeat(config: dict, wake_delay: Optional[int] = None) -> dict:
         log(f"Waiting {wake_delay}s wake delay before notifying", "heartbeat")
         time.sleep(wake_delay)
 
+    # Load per-task alert cooldown state
+    alert_state = _load_heartbeat_alert_state()
+
     # Send notifications for each missed task
     for task in missed_tasks:
         task_name = task["task_name"]
@@ -268,7 +324,7 @@ def run_heartbeat(config: dict, wake_delay: Optional[int] = None) -> dict:
 
         log(f"Notifying for missed task: {task_name} ({hours_overdue:.1f}h overdue, {level})", "heartbeat")
 
-        # Send macOS notification with actions
+        # Send macOS notification with actions (always — lightweight, local)
         _send_missed_task_notification(
             task_name=task_name,
             display_name=display_name,
@@ -276,23 +332,35 @@ def run_heartbeat(config: dict, wake_delay: Optional[int] = None) -> dict:
             threshold=threshold,
         )
 
-        # Send Slack notification (informational only)
-        if last_run:
-            try:
-                last_run_str = datetime.fromisoformat(last_run).strftime("%Y-%m-%d %H:%M")
-            except ValueError:
-                last_run_str = "Unknown"
-        else:
-            last_run_str = "Never"
+        # Send Slack notification only if cooldown allows
+        if _should_alert_for_task(task_name, level, alert_state):
+            if last_run:
+                try:
+                    last_run_str = datetime.fromisoformat(last_run).strftime("%Y-%m-%d %H:%M")
+                except ValueError:
+                    last_run_str = "Unknown"
+            else:
+                last_run_str = "Never"
 
-        slack_message = f"""*Pinglet: {level_prefix}Missed Task*
+            slack_message = f"""*Pinglet: {level_prefix}Missed Task*
 `{task_name}` hasn't run in {hours_overdue + threshold:.1f} hours (threshold: {threshold}h)
 Last successful run: {last_run_str}
 Escalation: {level.upper()}
 
 _Use macOS notification to Run or Ignore_"""
 
-        _send_slack_message(slack_message)
+            _send_slack_message(slack_message)
+
+            # Update cooldown state for this task
+            alert_state[task_name] = {
+                "last_alert": datetime.now().isoformat(),
+                "escalation": level,
+            }
+        else:
+            log(f"Slack alert suppressed for {task_name} (cooldown active)", "heartbeat")
+
+    # Save updated alert state
+    _save_heartbeat_alert_state(alert_state)
 
     return {
         "missed_count": len(missed_tasks),
