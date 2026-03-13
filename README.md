@@ -8,6 +8,12 @@
 
 A universal task wrapper for macOS that guarantees no silent failures. Wraps scheduled tasks with unified logging, state tracking, and alerts (Slack + macOS).
 
+## What's a Pinglet?
+
+A **pinglet** is an individual scheduled task managed by Pinglet. Each pinglet wraps a command with reliability features — retries, state tracking, alerting, and missed-run detection. Examples: the UCE link collector is a pinglet, Obsidian git-sync is a pinglet, the daily health check is a pinglet.
+
+Think of it like pods in Kubernetes or containers in Docker — "pinglet" is the unit noun for a scheduled task-agent in this system.
+
 ---
 
 ## Agent Instructions
@@ -18,7 +24,7 @@ Run `--help` for the full CLI reference in one call:
 /path/to/pinglet/venv/bin/python /path/to/pinglet/pinglet.py --help
 ```
 
-All task management commands output JSON to stdout. Parse `ok` field for success/failure.
+All management commands output JSON to stdout. Parse `ok` field for success/failure.
 
 ### Quick Reference
 
@@ -92,12 +98,12 @@ $P --task-logs my-task 200  # more log lines if needed
 
 ## Features
 
-- **Task Management CLI**: Add, edit, remove, enable, disable tasks — all via CLI with JSON output
+- **Pinglet Management CLI**: Add, edit, remove, enable, disable pinglets — all via CLI with JSON output
 - **Reliability System**: Automatic retry with exponential backoff, consecutive failure thresholds, alert cooldown
-- **Missed Task Detection**: Hourly heartbeat detects tasks that couldn't run (laptop asleep, etc.)
+- **Missed Pinglet Detection**: Hourly heartbeat detects pinglets that couldn't run (laptop asleep, etc.)
 - **Actionable Notifications**: macOS notifications with Run/Ignore buttons, Slack messages
-- **Output Formatting**: Task-configurable output parsing for rich notification summaries (JSON/text)
-- **Task Queue**: Sequential execution with configurable gaps between tasks
+- **Output Formatting**: Per-pinglet output parsing for rich notification summaries (JSON/text)
+- **Pinglet Queue**: Sequential execution with configurable gaps between pinglets
 - **Monitoring Self-Protection**: Every CLI invocation checks if watchdog agents are alive; surviving agents detect and alert when monitoring is down ("who watches the watchmen")
 - **LaunchAgent Health Detection**: Real-time `launchctl` status checks detect disabled (exit 78), failed, and not-loaded agents — not just plist existence
 - **Escalation Tiers**: Staleness alerts escalate from warning (2x threshold) to urgent (5x) to critical (10x)
@@ -105,16 +111,16 @@ $P --task-logs my-task 200  # more log lines if needed
 ## Quick Start
 
 ```bash
-# Run a task
+# Run a pinglet
 ./venv/bin/python pinglet.py --task uce
 
-# List all tasks (includes LaunchAgent status + warnings)
+# List all pinglets (includes LaunchAgent status + warnings)
 ./venv/bin/python pinglet.py --list
 
-# List all tasks (JSON)
+# List all pinglets (JSON)
 ./venv/bin/python pinglet.py --list --json
 
-# Show full task details + logs
+# Show full pinglet details + logs
 ./venv/bin/python pinglet.py --task-show uce
 
 # Run health check
@@ -124,7 +130,7 @@ $P --task-logs my-task 200  # more log lines if needed
 ./venv/bin/python pinglet.py --test-alerts
 ```
 
-## Adding a New Task
+## Adding a New Pinglet
 
 ```bash
 # Add task with schedule
@@ -158,7 +164,7 @@ $P --task-logs my-task 200  # more log lines if needed
 | `--failures-before-alert` | No | 3 | Consecutive failures before alerting |
 | `--schedule-spec` | No | null | Schedule (see syntax above) |
 
-## Editing and Removing Tasks
+## Editing and Removing Pinglets
 
 ```bash
 # Edit (only specified fields update)
@@ -204,9 +210,9 @@ Staleness alerts escalate based on how far past the threshold a task is:
 
 Generated plists include `KeepAlive > SuccessfulExit: false` so launchd restarts agents that exit non-zero instead of permanently disabling them. The heartbeat agent uses `KeepAlive: true` for maximum resilience.
 
-## Missed Task Detection
+## Missed Pinglet Detection
 
-Pinglet detects when scheduled tasks haven't run (e.g., laptop was asleep) and notifies with actionable options.
+Pinglet detects when scheduled pinglets haven't run (e.g., laptop was asleep) and notifies with actionable options.
 
 ### Install Heartbeat
 
@@ -218,9 +224,9 @@ Pinglet detects when scheduled tasks haven't run (e.g., laptop was asleep) and n
 ### How It Works
 
 1. Heartbeat runs hourly via LaunchAgent
-2. Checks each task's `last_run` against `healthcheck.expected_intervals`
+2. Checks each pinglet's `last_run` against `healthcheck.expected_intervals`
 3. Checks `launchctl` for disabled/failed agents
-4. For missed tasks, sends macOS notification with Run/Ignore buttons
+4. For missed pinglets, sends macOS notification with Run/Ignore buttons
 5. For disabled agents, sends urgent Slack alert with fix commands
 6. Also sends Slack message with escalation level (warning/urgent/critical)
 7. 30-second wake delay allows system to stabilize after wake
@@ -235,7 +241,7 @@ Pinglet detects when scheduled tasks haven't run (e.g., laptop was asleep) and n
 
 ## Output Formatting
 
-Tasks can configure custom output formatters for rich notification summaries.
+Pinglets can configure custom output formatters for rich notification summaries.
 
 ### Text Format (Default)
 
@@ -349,16 +355,16 @@ pinglet/
 ├── pinglet.py              # Main entry point + CLI + watchdog self-check
 ├── config.yaml             # Task registry and configuration
 ├── lib/
-│   ├── task_manager.py     # Task CRUD, schedule parsing, plist generation, launchd status
+│   ├── task_manager.py     # Pinglet CRUD, schedule parsing, plist generation, launchd status
 │   ├── alerts.py           # Slack + macOS notifications + critical monitoring alerts
 │   ├── reliability.py      # Retry, threshold, cooldown logic
-│   ├── state.py            # Task state tracking (JSON)
+│   ├── state.py            # Pinglet state tracking (JSON)
 │   ├── logging.py          # Structured logging
-│   ├── heartbeat.py        # Missed task detection + disabled agent detection + escalation
-│   ├── ignored.py          # Ignored tasks management
-│   ├── queue.py            # Task queue for sequential execution
+│   ├── heartbeat.py        # Missed pinglet detection + disabled agent detection + escalation
+│   ├── ignored.py          # Ignored pinglets management
+│   ├── queue.py            # Pinglet queue for sequential execution
 │   └── output_formatter.py # Output formatting (JSON/text)
-├── tests/                  # Test suite (167 tests)
+├── tests/                  # Test suite (175 tests)
 ├── state/                  # Per-task state files (*.json)
 ├── logs/                   # Log files
 └── launchagents/           # Generated LaunchAgent plists

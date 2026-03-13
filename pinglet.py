@@ -543,7 +543,7 @@ def uninstall_heartbeat() -> int:
 
 
 def list_tasks(json_mode: bool = False) -> None:
-    """List all registered tasks."""
+    """List all registered pinglets."""
     if json_mode:
         from lib.task_manager import list_tasks_json
         print(json.dumps(list_tasks_json(), indent=2))
@@ -554,7 +554,7 @@ def list_tasks(json_mode: bool = False) -> None:
     config = load_config()
     tasks = config.get("tasks", {})
 
-    print("\nRegistered Tasks:")
+    print("\nRegistered Pinglets:")
     print("-" * 60)
 
     disabled_agents = []
@@ -745,38 +745,40 @@ def handle_schedule(args) -> int:
 # Agent-Friendly Help
 # =============================================================================
 
-HELP_TEXT = """Pinglet Task Manager — No silent failures
+HELP_TEXT = """Pinglet — No silent failures
 
-TASK MANAGEMENT:
-  --task-add ID              Add task (requires --command)
-  --task-edit ID             Edit task (only specified fields update)
-  --task-remove ID           Remove task (auto-disables if scheduled)
-  --task-show ID             Full task details + state + recent logs (JSON)
-  --task-logs ID [N]         Last N lines of task logs (default: 50)
+A "pinglet" is an individual scheduled task managed by this system.
+
+PINGLET MANAGEMENT:
+  --task-add ID              Add a new pinglet (requires --command)
+  --task-edit ID             Edit a pinglet (only specified fields update)
+  --task-remove ID           Remove a pinglet (auto-disables if scheduled)
+  --task-show ID             Full pinglet details + state + recent logs (JSON)
+  --task-logs ID [N]         Last N lines of pinglet logs (default: 50)
   --task-enable ID           Generate plist + load LaunchAgent
   --task-disable ID          Unload LaunchAgent + remove plist
-  --list [--json]            List all tasks (--json for structured output)
-  --schedule ID SPEC         Set task schedule (see syntax below)
+  --list [--json]            List all pinglets (--json for structured output)
+  --schedule ID SPEC         Set pinglet schedule (see syntax below)
   --dry-run                  Preview changes without modifying
 
-TASK EXECUTION:
-  --task ID, -t ID           Run a registered task now
-  --run-now TASK             Run a missed task immediately
-  --ignore TASK              Mark missed task as ignored
+EXECUTION:
+  --task ID, -t ID           Run a pinglet now
+  --run-now TASK             Run a missed pinglet immediately
+  --ignore TASK              Mark missed pinglet as ignored
   --healthcheck, -H          Run daily health summary
-  --heartbeat                Check for missed tasks
+  --heartbeat                Check for missed pinglets
   --test-alerts              Test Slack + macOS notifications
   --install-heartbeat        Install heartbeat LaunchAgent
   --uninstall-heartbeat      Uninstall heartbeat LaunchAgent
 
-TASK CONFIG FLAGS (use with --task-add or --task-edit):
+CONFIG FLAGS (use with --task-add or --task-edit):
   --command PATH             Executable path (required for add)
-  --name TEXT                Display name (default: title-cased task ID)
+  --name TEXT                Display name (default: title-cased pinglet ID)
   --args ARG [ARG ...]       Command arguments
   --working-dir PATH         Working directory
   --timeout SECS             Timeout in seconds (default: 300)
   --env VAR [VAR ...]        Env vars to pass through
-  --output-format text|json  Task output format (default: text)
+  --output-format text|json  Output format (default: text)
   --summary-template TEXT    Template for JSON output (e.g. "Processed {count} items")
   --failures-before-alert N  Consecutive failures before alerting (default: 3)
   --schedule-spec SPEC       Schedule (inline with add/edit, see syntax below)
@@ -796,16 +798,16 @@ OUTPUT:
   Exit codes: 0=success, 1=error, 2=validation error
 
 EXAMPLES:
-  # Add a task with schedule
+  # Add a pinglet with schedule
   pinglet.py --task-add my-task --command /usr/bin/python3 --args script.py --schedule-spec "daily 7:00"
 
   # Enable scheduling (generates plist + loads LaunchAgent)
   pinglet.py --task-enable my-task
 
-  # Show full task details including logs
+  # Show full pinglet details including logs
   pinglet.py --task-show my-task
 
-  # View recent task logs
+  # View recent pinglet logs
   pinglet.py --task-logs my-task 100
 
   # Edit timeout and reschedule
@@ -813,10 +815,10 @@ EXAMPLES:
   pinglet.py --schedule my-task "every 2h"
   pinglet.py --task-enable my-task
 
-  # List all tasks as JSON
+  # List all pinglets as JSON
   pinglet.py --list --json
 
-  # Remove task (auto-disables)
+  # Remove a pinglet (auto-disables)
   pinglet.py --task-remove my-task
 
   # Dry-run any mutating command
