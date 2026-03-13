@@ -45,6 +45,62 @@ def _send_slack_message(message):
     return alerts_module.send_slack_message(message)
 
 
+def _get_launchd_status(task_id: str) -> dict:
+    """Wrapper for get_launchd_status to allow patching."""
+    from lib.task_manager import get_launchd_status
+    return get_launchd_status(task_id)
+
+
+def detect_disabled_agents(config: dict) -> List[Dict]:
+    """Detect LaunchAgents that are disabled by launchd (exit code 78).
+
+    Args:
+        config: Full configuration dictionary
+
+    Returns:
+        List of dicts with keys: task_id, label, exit_code, status
+    """
+    from lib.task_manager import MONITORING_AGENTS
+
+    tasks_config = config.get("tasks", {})
+    all_ids = list(tasks_config.keys()) + [a for a in MONITORING_AGENTS if a not in tasks_config]
+
+    disabled = []
+    for task_id in all_ids:
+        status = _get_launchd_status(task_id)
+        if status["disabled"] or status["status"] == "failed":
+            disabled.append({
+                "task_id": task_id,
+                "label": f"com.pinglet.{task_id}",
+                "exit_code": status["exit_code"],
+                "status": status["status"],
+            })
+
+    return disabled
+
+
+def get_escalation_level(hours_overdue: float, threshold: float) -> str:
+    """Determine escalation level based on staleness multiplier.
+
+    Args:
+        hours_overdue: Hours past threshold
+        threshold: Expected interval in hours
+
+    Returns:
+        Escalation level: "warning", "urgent", or "critical"
+    """
+    total_hours = hours_overdue + threshold
+    if threshold <= 0:
+        return "warning"
+
+    multiplier = total_hours / threshold
+    if multiplier >= 10:
+        return "critical"
+    elif multiplier >= 5:
+        return "urgent"
+    return "warning"
+
+
 def detect_missed_tasks(config: dict) -> List[Dict]:
     """
     Detect tasks that haven't run within their expected interval.
@@ -169,17 +225,26 @@ def run_heartbeat(config: dict, wake_delay: Optional[int] = None) -> dict:
 
     log("Running heartbeat check", "heartbeat")
 
+    # Check for disabled agents first
+    disabled = detect_disabled_agents(config)
+    if disabled:
+        disabled_names = [d["task_id"] for d in disabled]
+        log(f"ALERT: {len(disabled)} disabled/failed agent(s): {', '.join(disabled_names)}", "heartbeat")
+        from lib.alerts import send_critical_monitoring_alert
+        send_critical_monitoring_alert(disabled)
+
     # Detect missed tasks
     missed_tasks = detect_missed_tasks(config)
 
-    if not missed_tasks:
+    if not missed_tasks and not disabled:
         log("All tasks up to date", "heartbeat")
-        return {"missed_count": 0, "tasks": []}
+        return {"missed_count": 0, "tasks": [], "disabled_agents": []}
 
-    log(f"Found {len(missed_tasks)} missed task(s)", "heartbeat")
+    if missed_tasks:
+        log(f"Found {len(missed_tasks)} missed task(s)", "heartbeat")
 
     # Wait for wake delay (allows system to stabilize after wake)
-    if wake_delay > 0:
+    if wake_delay > 0 and missed_tasks:
         log(f"Waiting {wake_delay}s wake delay before notifying", "heartbeat")
         time.sleep(wake_delay)
 
@@ -191,7 +256,17 @@ def run_heartbeat(config: dict, wake_delay: Optional[int] = None) -> dict:
         threshold = task["threshold"]
         last_run = task.get("last_run")
 
-        log(f"Notifying for missed task: {task_name} ({hours_overdue:.1f}h overdue)", "heartbeat")
+        # Determine escalation level
+        level = get_escalation_level(hours_overdue, threshold)
+        task["escalation"] = level
+
+        level_prefix = ""
+        if level == "critical":
+            level_prefix = "CRITICAL: "
+        elif level == "urgent":
+            level_prefix = "URGENT: "
+
+        log(f"Notifying for missed task: {task_name} ({hours_overdue:.1f}h overdue, {level})", "heartbeat")
 
         # Send macOS notification with actions
         _send_missed_task_notification(
@@ -210,9 +285,10 @@ def run_heartbeat(config: dict, wake_delay: Optional[int] = None) -> dict:
         else:
             last_run_str = "Never"
 
-        slack_message = f"""*Pinglet: Missed Task*
+        slack_message = f"""*Pinglet: {level_prefix}Missed Task*
 `{task_name}` hasn't run in {hours_overdue + threshold:.1f} hours (threshold: {threshold}h)
 Last successful run: {last_run_str}
+Escalation: {level.upper()}
 
 _Use macOS notification to Run or Ignore_"""
 
@@ -221,4 +297,5 @@ _Use macOS notification to Run or Ignore_"""
     return {
         "missed_count": len(missed_tasks),
         "tasks": missed_tasks,
+        "disabled_agents": disabled,
     }

@@ -98,6 +98,9 @@ $P --task-logs my-task 200  # more log lines if needed
 - **Actionable Notifications**: macOS notifications with Run/Ignore buttons, Slack messages
 - **Output Formatting**: Task-configurable output parsing for rich notification summaries (JSON/text)
 - **Task Queue**: Sequential execution with configurable gaps between tasks
+- **Monitoring Self-Protection**: Every CLI invocation checks if watchdog agents are alive; surviving agents detect and alert when monitoring is down ("who watches the watchmen")
+- **LaunchAgent Health Detection**: Real-time `launchctl` status checks detect disabled (exit 78), failed, and not-loaded agents — not just plist existence
+- **Escalation Tiers**: Staleness alerts escalate from warning (2x threshold) to urgent (5x) to critical (10x)
 
 ## Quick Start
 
@@ -105,7 +108,7 @@ $P --task-logs my-task 200  # more log lines if needed
 # Run a task
 ./venv/bin/python pinglet.py --task uce
 
-# List all tasks
+# List all tasks (includes LaunchAgent status + warnings)
 ./venv/bin/python pinglet.py --list
 
 # List all tasks (JSON)
@@ -175,6 +178,32 @@ $P --task-logs my-task 200  # more log lines if needed
 ./venv/bin/python pinglet.py --task-remove my-task --dry-run
 ```
 
+## Monitoring & Self-Protection
+
+### LaunchAgent Status Detection
+
+`--list` and `--healthcheck` now query `launchctl` directly for real agent state instead of just checking if the plist file exists. This catches agents that launchd has disabled (exit code 78) — a common failure mode after reboot or macOS updates.
+
+Statuses: `RUNNING`, `IDLE` (loaded, waiting for schedule), `DISABLED` (exit 78), `FAILED`, `NOT_LOADED`, `NOT_INSTALLED`.
+
+### Who Watches the Watchmen
+
+Every CLI invocation checks if the healthcheck and heartbeat monitoring agents are alive. If they're dead, a warning prints to stderr. After any successful task run, a debounced Slack alert fires (24h cooldown) so monitoring failures don't go unnoticed.
+
+### Escalation Tiers
+
+Staleness alerts escalate based on how far past the threshold a task is:
+
+| Multiplier | Level | Example (2h threshold) |
+|------------|-------|------------------------|
+| 2x | Warning | 4h since last run |
+| 5x | Urgent | 10h since last run |
+| 10x | Critical | 20h since last run |
+
+### Plist Hardening
+
+Generated plists include `KeepAlive > SuccessfulExit: false` so launchd restarts agents that exit non-zero instead of permanently disabling them. The heartbeat agent uses `KeepAlive: true` for maximum resilience.
+
 ## Missed Task Detection
 
 Pinglet detects when scheduled tasks haven't run (e.g., laptop was asleep) and notifies with actionable options.
@@ -190,9 +219,11 @@ Pinglet detects when scheduled tasks haven't run (e.g., laptop was asleep) and n
 
 1. Heartbeat runs hourly via LaunchAgent
 2. Checks each task's `last_run` against `healthcheck.expected_intervals`
-3. For missed tasks, sends macOS notification with Run/Ignore buttons
-4. Also sends Slack message (informational only)
-5. 30-second wake delay allows system to stabilize after wake
+3. Checks `launchctl` for disabled/failed agents
+4. For missed tasks, sends macOS notification with Run/Ignore buttons
+5. For disabled agents, sends urgent Slack alert with fix commands
+6. Also sends Slack message with escalation level (warning/urgent/critical)
+7. 30-second wake delay allows system to stabilize after wake
 
 ### Manual Commands
 
@@ -238,7 +269,7 @@ With stdout `{"tabs_archived": 12, "tabs_kept": 8}`, the notification shows: `Ar
 | `--task-enable <id>` | Generate plist + load LaunchAgent |
 | `--task-disable <id>` | Unload + remove plist |
 | `--schedule <id> <spec>` | Set task schedule |
-| `--list [--json]` | List all tasks |
+| `--list [--json]` | List all tasks (includes LaunchAgent status) |
 | `--dry-run` | Preview changes |
 
 ### Task Execution
@@ -248,8 +279,8 @@ With stdout `{"tabs_archived": 12, "tabs_kept": 8}`, the notification shows: `Ar
 | `--task <name>`, `-t` | Run a registered task |
 | `--run-now <task>` | Run a missed task immediately |
 | `--ignore <task>` | Mark a missed task as ignored |
-| `--healthcheck`, `-H` | Run daily health summary |
-| `--heartbeat` | Run heartbeat check |
+| `--healthcheck`, `-H` | Run daily health summary (checks launchd status) |
+| `--heartbeat` | Run heartbeat check (detects disabled agents) |
 | `--test-alerts` | Test notification system |
 | `--install-heartbeat` | Install heartbeat LaunchAgent |
 | `--uninstall-heartbeat` | Uninstall heartbeat LaunchAgent |
@@ -315,19 +346,19 @@ healthcheck:
 
 ```
 pinglet/
-├── pinglet.py              # Main entry point + CLI
+├── pinglet.py              # Main entry point + CLI + watchdog self-check
 ├── config.yaml             # Task registry and configuration
 ├── lib/
-│   ├── task_manager.py     # Task CRUD, schedule parsing, plist generation
-│   ├── alerts.py           # Slack + macOS notifications
+│   ├── task_manager.py     # Task CRUD, schedule parsing, plist generation, launchd status
+│   ├── alerts.py           # Slack + macOS notifications + critical monitoring alerts
 │   ├── reliability.py      # Retry, threshold, cooldown logic
 │   ├── state.py            # Task state tracking (JSON)
 │   ├── logging.py          # Structured logging
-│   ├── heartbeat.py        # Missed task detection
+│   ├── heartbeat.py        # Missed task detection + disabled agent detection + escalation
 │   ├── ignored.py          # Ignored tasks management
 │   ├── queue.py            # Task queue for sequential execution
 │   └── output_formatter.py # Output formatting (JSON/text)
-├── tests/                  # Test suite (149 tests)
+├── tests/                  # Test suite (167 tests)
 ├── state/                  # Per-task state files (*.json)
 ├── logs/                   # Log files
 └── launchagents/           # Generated LaunchAgent plists
@@ -336,7 +367,7 @@ pinglet/
 ## Troubleshooting
 
 ```bash
-# Show full task debug info (config + state + logs)
+# Show full task debug info (config + state + launchd status + logs)
 ./venv/bin/python pinglet.py --task-show <task-id>
 
 # View recent logs for a task
@@ -345,8 +376,14 @@ pinglet/
 # Test a task manually
 ./venv/bin/python pinglet.py --task <task-id>
 
-# Check LaunchAgent status
+# Check LaunchAgent status (shows disabled agents with exit 78)
+./venv/bin/python pinglet.py --list
+
+# Raw launchctl status
 launchctl list | grep pinglet
+
+# Re-enable a disabled agent
+./venv/bin/python pinglet.py --task-enable <task-id>
 
 # Run tests
 ./venv/bin/python -m pytest tests/ -v

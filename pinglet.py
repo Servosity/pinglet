@@ -189,6 +189,13 @@ def run_task(task_name: str) -> int:
             )
             reliability.record_alert_sent()
 
+    # After each task run, check if monitoring agents are dead
+    # This is the "who watches the watchmen" safety net
+    if success:
+        dead = _check_monitoring_agents()
+        if dead:
+            _maybe_send_monitoring_alert(dead)
+
     return exit_code
 
 
@@ -196,9 +203,16 @@ def run_healthcheck() -> int:
     """
     Run daily health check - summarizes all task states.
 
+    Checks both state timestamps AND launchd agent status.
+    Agents disabled by launchd (exit 78) are flagged regardless of
+    what the state file says — this catches the "task stopped after
+    success" blindspot.
+
     Returns:
         Exit code (0 for healthy, 1 for issues)
     """
+    from lib.task_manager import get_launchd_status
+
     config = load_config()
     expected_intervals = config.get("healthcheck", {}).get("expected_intervals", {})
     tasks_config = config.get("tasks", {})
@@ -214,14 +228,24 @@ def run_healthcheck() -> int:
         task_name = state.task_name
         display_name = tasks_config.get(task_name, {}).get("name", task_name)
 
+        # Check launchd status first — overrides state-file checks
+        launchd = get_launchd_status(task_name)
+
         # Calculate time since last run
         issue = None
         status = "OK"
 
-        if state.last_run:
+        if launchd["disabled"]:
+            status = "DISABLED"
+            issue = f"LaunchAgent disabled (exit 78) — run: --task-enable {task_name}"
+            all_healthy = False
+        elif launchd["status"] == "failed":
+            status = "AGENT_FAILED"
+            issue = f"LaunchAgent failed (exit {launchd['exit_code']})"
+            all_healthy = False
+        elif state.last_run:
             last_run_dt = datetime.fromisoformat(state.last_run)
             hours_since = (now - last_run_dt).total_seconds() / 3600
-            last_run_str = last_run_dt.strftime("%I:%M %p")
 
             # Check expected interval
             expected_hours = expected_intervals.get(task_name)
@@ -236,10 +260,16 @@ def run_healthcheck() -> int:
                 issue = f"{state.consecutive_failures} consecutive failures"
                 all_healthy = False
         else:
-            last_run_str = "Never"
             status = "UNKNOWN"
             issue = "Task has never run"
             all_healthy = False
+
+        last_run_str = "Never"
+        if state.last_run:
+            try:
+                last_run_str = datetime.fromisoformat(state.last_run).strftime("%I:%M %p")
+            except ValueError:
+                last_run_str = state.last_run
 
         task_summaries.append({
             "name": display_name,
@@ -253,12 +283,21 @@ def run_healthcheck() -> int:
     for task_name in tasks_config:
         if not any(s.task_name == task_name for s in states):
             display_name = tasks_config[task_name].get("name", task_name)
+            launchd = get_launchd_status(task_name)
+
+            if launchd["disabled"]:
+                issue = f"LaunchAgent disabled (exit 78) — run: --task-enable {task_name}"
+                status = "DISABLED"
+            else:
+                issue = "No state file"
+                status = "UNKNOWN"
+
             task_summaries.append({
                 "name": display_name,
                 "last_run": "Never",
-                "status": "UNKNOWN",
+                "status": status,
                 "runs_today": 0,
-                "issue": "No state file",
+                "issue": issue,
             })
             all_healthy = False
 
@@ -437,8 +476,10 @@ def install_heartbeat() -> int:
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
+    <key>KeepAlive</key>
+    <true/>
 </dict>
 </plist>
 """
@@ -510,11 +551,15 @@ def list_tasks(json_mode: bool = False) -> None:
         print(json.dumps(list_tasks_json(), indent=2))
         return
 
+    from lib.task_manager import get_launchd_status
+
     config = load_config()
     tasks = config.get("tasks", {})
 
     print("\nRegistered Tasks:")
     print("-" * 60)
+
+    disabled_agents = []
 
     for task_name, task_config in tasks.items():
         display_name = task_config.get("name", task_name)
@@ -526,16 +571,42 @@ def list_tasks(json_mode: bool = False) -> None:
         last_run = state.last_run or "Never"
         status = state.last_status
 
+        # Get launchd status
+        launchd = get_launchd_status(task_name)
+        launchd_str = launchd["status"].upper()
+        if launchd["disabled"]:
+            launchd_str = f"\033[1;31mDISABLED (exit 78)\033[0m"
+            disabled_agents.append(task_name)
+        elif launchd["status"] == "failed":
+            launchd_str = f"\033[1;33mFAILED (exit {launchd['exit_code']})\033[0m"
+        elif launchd["status"] == "running":
+            launchd_str = f"\033[32mRUNNING\033[0m"
+
         print(f"\n  {task_name}:")
         print(f"    Name: {display_name}")
         print(f"    Command: {command}")
         print(f"    Timeout: {timeout}s")
         print(f"    Last Run: {last_run}")
         print(f"    Status: {status}")
+        print(f"    LaunchAgent: {launchd_str}")
         if state.consecutive_failures > 0:
             print(f"    Consecutive Failures: {state.consecutive_failures}")
 
-    print()
+    # Warning banner if any agents are disabled
+    if disabled_agents:
+        print()
+        print("\033[1;31m" + "=" * 60)
+        print("  WARNING: DISABLED LaunchAgents detected!")
+        print("=" * 60 + "\033[0m")
+        print(f"  The following agents have exit code 78 (disabled by launchd):")
+        for agent in disabled_agents:
+            print(f"    - {agent}")
+        print(f"\n  Fix: Re-enable each agent:")
+        for agent in disabled_agents:
+            print(f"    ./venv/bin/python pinglet.py --task-enable {agent}")
+        print()
+    else:
+        print()
 
 
 # =============================================================================
@@ -755,6 +826,72 @@ EXAMPLES:
 """
 
 
+def _check_monitoring_agents() -> list:
+    """Check if monitoring agents (healthcheck, heartbeat) are dead.
+
+    Returns list of dead agent task_ids. Prints warning to stderr.
+    """
+    from lib.task_manager import get_launchd_status, MONITORING_AGENTS
+
+    dead = []
+    for agent_id in MONITORING_AGENTS:
+        status = get_launchd_status(agent_id)
+        if status["disabled"] or status["status"] in ("failed", "not_loaded", "not_installed"):
+            dead.append(agent_id)
+
+    if dead:
+        print(
+            f"\033[1;31mWARNING: Monitoring agent(s) DOWN: {', '.join(dead)}\033[0m",
+            file=sys.stderr,
+        )
+        print(
+            f"  Fix: ./venv/bin/python pinglet.py --task-enable <agent>",
+            file=sys.stderr,
+        )
+
+    return dead
+
+
+def _maybe_send_monitoring_alert(dead_agents: list) -> None:
+    """Send a debounced Slack alert if monitoring agents are dead.
+
+    Only re-alerts after 24h or if the set of dead agents changed.
+    Uses state/_monitoring_alert.json for debounce tracking.
+    """
+    if not dead_agents:
+        return
+
+    from lib.state import STATE_DIR
+    alert_file = STATE_DIR / "_monitoring_alert.json"
+    now = datetime.now()
+    dead_set = sorted(dead_agents)
+
+    # Check debounce
+    if alert_file.exists():
+        try:
+            with open(alert_file, "r") as f:
+                prev = json.load(f)
+            prev_agents = sorted(prev.get("agents", []))
+            prev_time = datetime.fromisoformat(prev.get("timestamp", "2000-01-01"))
+            hours_since = (now - prev_time).total_seconds() / 3600
+
+            # Skip if same set of dead agents and less than 24h since last alert
+            if prev_agents == dead_set and hours_since < 24:
+                return
+        except (json.JSONDecodeError, ValueError, KeyError):
+            pass  # Corrupted file, re-alert
+
+    # Send alert
+    from lib.alerts import send_critical_monitoring_alert
+    disabled_info = [{"task_id": a, "label": f"com.pinglet.{a}", "exit_code": 78, "status": "disabled"} for a in dead_agents]
+    send_critical_monitoring_alert(disabled_info)
+
+    # Write debounce file
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(alert_file, "w") as f:
+        json.dump({"agents": dead_set, "timestamp": now.isoformat()}, f)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Pinglet - Universal task wrapper that guarantees no silent failures",
@@ -805,6 +942,10 @@ def main():
     if args.help or len(sys.argv) == 1:
         print(HELP_TEXT)
         sys.exit(0)
+
+    # Lightweight self-check: warn if monitoring agents are dead
+    # This runs on every CLI invocation so any surviving agent detects dead watchdogs
+    _check_monitoring_agents()
 
     # Task management dispatch (before existing commands)
     if args.task_add:

@@ -222,3 +222,99 @@ class TestStaleNotificationHandling:
             should_run, reason = should_run_task("uce", sample_config)
 
             assert should_run is True
+
+
+class TestDetectDisabledAgents:
+    """Tests for detect_disabled_agents()."""
+
+    def test_detects_disabled_agent(self, sample_config):
+        """Disabled agent (exit 78) should be detected."""
+        def mock_status(task_id):
+            if task_id == "uce":
+                return {"installed": True, "running": False, "exit_code": 78, "disabled": True, "status": "disabled"}
+            return {"installed": True, "running": False, "exit_code": 0, "disabled": False, "status": "idle"}
+
+        with patch("lib.heartbeat._get_launchd_status", side_effect=mock_status):
+            from lib.heartbeat import detect_disabled_agents
+            disabled = detect_disabled_agents(sample_config)
+
+        task_ids = [d["task_id"] for d in disabled]
+        assert "uce" in task_ids
+
+    def test_detects_failed_agent(self, sample_config):
+        """Failed agent (non-zero, non-78 exit) should be detected."""
+        def mock_status(task_id):
+            if task_id == "obsidian-tab-archiver":
+                return {"installed": True, "running": False, "exit_code": 1, "disabled": False, "status": "failed"}
+            return {"installed": True, "running": False, "exit_code": 0, "disabled": False, "status": "idle"}
+
+        with patch("lib.heartbeat._get_launchd_status", side_effect=mock_status):
+            from lib.heartbeat import detect_disabled_agents
+            disabled = detect_disabled_agents(sample_config)
+
+        task_ids = [d["task_id"] for d in disabled]
+        assert "obsidian-tab-archiver" in task_ids
+
+    def test_healthy_agents_not_detected(self, sample_config):
+        """Healthy agents should not be flagged."""
+        def mock_status(task_id):
+            return {"installed": True, "running": False, "exit_code": 0, "disabled": False, "status": "idle"}
+
+        with patch("lib.heartbeat._get_launchd_status", side_effect=mock_status):
+            from lib.heartbeat import detect_disabled_agents
+            disabled = detect_disabled_agents(sample_config)
+
+        assert len(disabled) == 0
+
+    def test_includes_monitoring_agents(self, sample_config):
+        """Should also check monitoring agents (healthcheck, heartbeat)."""
+        def mock_status(task_id):
+            if task_id == "healthcheck":
+                return {"installed": True, "running": False, "exit_code": 78, "disabled": True, "status": "disabled"}
+            return {"installed": True, "running": False, "exit_code": 0, "disabled": False, "status": "idle"}
+
+        with patch("lib.heartbeat._get_launchd_status", side_effect=mock_status):
+            from lib.heartbeat import detect_disabled_agents
+            disabled = detect_disabled_agents(sample_config)
+
+        task_ids = [d["task_id"] for d in disabled]
+        assert "healthcheck" in task_ids
+
+
+class TestEscalationLevels:
+    """Tests for escalation level calculation."""
+
+    def test_warning_level(self):
+        """2x threshold -> warning."""
+        from lib.heartbeat import get_escalation_level
+        # 14h threshold, 14h overdue = 28h total = 2x
+        assert get_escalation_level(14, 14) == "warning"
+
+    def test_urgent_level(self):
+        """5x threshold -> urgent."""
+        from lib.heartbeat import get_escalation_level
+        # 14h threshold, 56h overdue = 70h total = 5x
+        assert get_escalation_level(56, 14) == "urgent"
+
+    def test_critical_level(self):
+        """10x threshold -> critical."""
+        from lib.heartbeat import get_escalation_level
+        # 14h threshold, 126h overdue = 140h total = 10x
+        assert get_escalation_level(126, 14) == "critical"
+
+    def test_just_below_urgent(self):
+        """Just below 5x should be warning."""
+        from lib.heartbeat import get_escalation_level
+        # 2h threshold, 7h overdue = 9h total = 4.5x
+        assert get_escalation_level(7, 2) == "warning"
+
+    def test_just_at_urgent(self):
+        """Exactly 5x should be urgent."""
+        from lib.heartbeat import get_escalation_level
+        # 2h threshold, 8h overdue = 10h total = 5x
+        assert get_escalation_level(8, 2) == "urgent"
+
+    def test_zero_threshold(self):
+        """Zero threshold should default to warning."""
+        from lib.heartbeat import get_escalation_level
+        assert get_escalation_level(100, 0) == "warning"

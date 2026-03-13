@@ -17,6 +17,10 @@ import yaml
 
 from lib.state import load_state
 
+# --- Monitoring agent labels ---
+MONITORING_AGENTS = ["healthcheck", "heartbeat"]
+
+
 # --- Paths ---
 PROJECT_ROOT = Path(__file__).parent.parent
 CONFIG_PATH = PROJECT_ROOT / "config.yaml"
@@ -234,6 +238,11 @@ def generate_plist(task_id: str, schedule_dict: dict) -> str:
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
 </dict>
 </plist>
 """
@@ -424,6 +433,8 @@ def show_task(task_id: str) -> dict:
     log_result = get_task_logs(task_id, lines=20)
     logs = log_result.get("log_files", {})
 
+    launchd = get_launchd_status(task_id)
+
     return {
         "ok": True,
         "task_id": task_id,
@@ -438,6 +449,7 @@ def show_task(task_id: str) -> dict:
             "total_failures": state.total_failures,
         },
         "enabled": enabled,
+        "launchd": launchd,
         "schedule": schedule_str,
         "recent_logs": logs,
     }
@@ -452,6 +464,7 @@ def list_tasks_json() -> list:
     for task_id, task_config in tasks.items():
         state = load_state(task_id)
         enabled = is_task_enabled(task_id)
+        launchd = get_launchd_status(task_id)
         schedule_str = task_config.get("schedule")
 
         result.append({
@@ -461,6 +474,7 @@ def list_tasks_json() -> list:
             "timeout": task_config.get("timeout", 300),
             "schedule": schedule_str,
             "enabled": enabled,
+            "launchd": launchd,
             "last_run": state.last_run,
             "last_status": state.last_status,
             "consecutive_failures": state.consecutive_failures,
@@ -563,6 +577,121 @@ def disable_task(task_id: str) -> dict:
 def is_task_enabled(task_id: str) -> bool:
     """Check if a task's LaunchAgent is installed."""
     return (USER_LAUNCHAGENTS_DIR / f"com.pinglet.{task_id}.plist").exists()
+
+
+def get_launchd_status(task_id: str) -> Dict[str, Any]:
+    """Get actual launchd status for a task's LaunchAgent.
+
+    Returns dict with:
+        installed: bool - plist exists in ~/Library/LaunchAgents
+        running: bool - launchd reports the agent as running (PID != -)
+        exit_code: int or None - last exit code from launchctl list
+        disabled: bool - True if exit_code == 78
+        status: str - one of: running, disabled, failed, not_loaded, not_installed
+    """
+    label = f"com.pinglet.{task_id}"
+    plist_exists = (USER_LAUNCHAGENTS_DIR / f"{label}.plist").exists()
+
+    if not plist_exists:
+        return {
+            "installed": False,
+            "running": False,
+            "exit_code": None,
+            "disabled": False,
+            "status": "not_installed",
+        }
+
+    # Query launchctl list for this specific label
+    try:
+        result = subprocess.run(
+            ["launchctl", "list", label],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            # Agent plist exists but not loaded in launchd
+            return {
+                "installed": True,
+                "running": False,
+                "exit_code": None,
+                "disabled": False,
+                "status": "not_loaded",
+            }
+
+        # Parse output: launchctl list <label> outputs key-value pairs
+        # We need PID and LastExitStatus
+        pid = None
+        exit_code = None
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if '"PID"' in line or line.startswith('"PID"'):
+                # Format: "PID" = 12345;
+                parts = line.split("=")
+                if len(parts) >= 2:
+                    val = parts[1].strip().rstrip(";").strip()
+                    try:
+                        pid = int(val)
+                    except ValueError:
+                        pass
+            elif '"LastExitStatus"' in line or line.startswith('"LastExitStatus"'):
+                parts = line.split("=")
+                if len(parts) >= 2:
+                    val = parts[1].strip().rstrip(";").strip()
+                    try:
+                        exit_code = int(val)
+                    except ValueError:
+                        pass
+
+        # Determine status
+        # launchd stores exit codes as (exit_code << 8), so 78 -> 19968
+        normalized_exit = exit_code
+        if exit_code is not None and exit_code > 255:
+            normalized_exit = exit_code >> 8
+
+        is_running = pid is not None and pid > 0
+        is_disabled = normalized_exit == 78
+
+        if is_running:
+            status = "running"
+        elif is_disabled:
+            status = "disabled"
+        elif exit_code is not None and exit_code != 0:
+            status = "failed"
+        else:
+            status = "idle"  # loaded, not currently running, last exit was 0
+
+        return {
+            "installed": True,
+            "running": is_running,
+            "exit_code": normalized_exit,
+            "disabled": is_disabled,
+            "status": status,
+        }
+
+    except (subprocess.TimeoutExpired, OSError):
+        # launchctl failed — fall back to plist-existence check
+        return {
+            "installed": plist_exists,
+            "running": False,
+            "exit_code": None,
+            "disabled": False,
+            "status": "unknown",
+        }
+
+
+def get_all_launchd_statuses() -> Dict[str, Dict[str, Any]]:
+    """Get launchd status for all pinglet agents by parsing launchctl list once.
+
+    Returns dict mapping task_id -> status dict (same shape as get_launchd_status).
+    """
+    config = load_config()
+    task_ids = list(config.get("tasks", {}).keys())
+    # Also include monitoring agents
+    all_ids = task_ids + [a for a in MONITORING_AGENTS if a not in task_ids]
+
+    results = {}
+    for task_id in all_ids:
+        results[task_id] = get_launchd_status(task_id)
+    return results
 
 
 def set_schedule(task_id: str, schedule_spec: str) -> dict:

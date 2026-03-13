@@ -537,6 +537,55 @@ def send_manual_complete_notification(
         return False
 
 
+def send_critical_monitoring_alert(disabled_agents: list) -> bool:
+    """Send urgent Slack alert when monitoring agents themselves are dead.
+
+    This is a distinct, high-priority alert separate from regular task failures.
+    Includes fix commands for each disabled agent.
+
+    Args:
+        disabled_agents: List of dicts with keys: task_id, label, exit_code, status
+
+    Returns:
+        True if alert sent successfully
+    """
+    if not disabled_agents:
+        return True
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    agent_lines = []
+    fix_lines = []
+    for agent in disabled_agents:
+        agent_lines.append(f"• `{agent['task_id']}` — {agent['status']} (exit {agent['exit_code']})")
+        fix_lines.append(f"  ./venv/bin/python pinglet.py --task-enable {agent['task_id']}")
+
+    slack_message = f"""*Pinglet: MONITORING DOWN*
+
+*Timestamp:* {timestamp}
+*Status:* CRITICAL — monitoring agents are dead
+
+*Disabled agents:*
+{chr(10).join(agent_lines)}
+
+*Fix (run from ~/Documents/Dev/pinglet):*
+```
+{chr(10).join(fix_lines)}
+```
+
+_This means task failures may go undetected until agents are re-enabled._"""
+
+    result = send_slack_message(slack_message)
+
+    # Also send macOS notification
+    agent_names = ", ".join(a["task_id"] for a in disabled_agents[:3])
+    send_macos_notification(
+        "Pinglet: MONITORING DOWN",
+        f"Disabled agents: {agent_names}\nTask failures may go undetected!",
+    )
+
+    return result
+
+
 def test_alerts() -> dict:
     """
     Test the notification system.

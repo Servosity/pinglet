@@ -16,6 +16,7 @@ from lib.task_manager import (
     validate_task_config,
     generate_plist,
     estimate_expected_interval,
+    get_launchd_status,
     _parse_time,
     _deep_merge,
 )
@@ -622,3 +623,156 @@ class TestDeepMerge:
         base = {"a": "string"}
         _deep_merge(base, {"a": {"nested": True}})
         assert base == {"a": {"nested": True}}
+
+
+# =============================================================================
+# LaunchAgent Status Detection
+# =============================================================================
+
+
+class TestGetLaunchdStatus:
+    """Tests for get_launchd_status() with mocked launchctl output."""
+
+    def test_not_installed(self, tmp_path):
+        """Agent plist doesn't exist -> not_installed."""
+        user_la_dir = tmp_path / "Library" / "LaunchAgents"
+        user_la_dir.mkdir(parents=True)
+
+        with patch("lib.task_manager.USER_LAUNCHAGENTS_DIR", user_la_dir):
+            result = get_launchd_status("nonexistent")
+
+        assert result["installed"] is False
+        assert result["status"] == "not_installed"
+        assert result["disabled"] is False
+
+    def test_disabled_exit_78(self, tmp_path):
+        """Agent with exit code 78 -> disabled."""
+        user_la_dir = tmp_path / "Library" / "LaunchAgents"
+        user_la_dir.mkdir(parents=True)
+        (user_la_dir / "com.pinglet.my-task.plist").write_text("<plist/>")
+
+        launchctl_output = '''{
+\t"LimitLoadToSessionType" = "Aqua";
+\t"Label" = "com.pinglet.my-task";
+\t"LastExitStatus" = 78;
+\t"PID" = 0;
+};
+'''
+        mock_result = MagicMock(returncode=0, stdout=launchctl_output, stderr="")
+
+        with patch("lib.task_manager.USER_LAUNCHAGENTS_DIR", user_la_dir), \
+             patch("subprocess.run", return_value=mock_result):
+            result = get_launchd_status("my-task")
+
+        assert result["installed"] is True
+        assert result["disabled"] is True
+        assert result["exit_code"] == 78
+        assert result["status"] == "disabled"
+
+    def test_running_agent(self, tmp_path):
+        """Agent with a PID -> running."""
+        user_la_dir = tmp_path / "Library" / "LaunchAgents"
+        user_la_dir.mkdir(parents=True)
+        (user_la_dir / "com.pinglet.my-task.plist").write_text("<plist/>")
+
+        launchctl_output = '''{
+\t"Label" = "com.pinglet.my-task";
+\t"LastExitStatus" = 0;
+\t"PID" = 12345;
+};
+'''
+        mock_result = MagicMock(returncode=0, stdout=launchctl_output, stderr="")
+
+        with patch("lib.task_manager.USER_LAUNCHAGENTS_DIR", user_la_dir), \
+             patch("subprocess.run", return_value=mock_result):
+            result = get_launchd_status("my-task")
+
+        assert result["installed"] is True
+        assert result["running"] is True
+        assert result["status"] == "running"
+        assert result["disabled"] is False
+
+    def test_failed_agent(self, tmp_path):
+        """Agent with non-zero, non-78 exit code -> failed."""
+        user_la_dir = tmp_path / "Library" / "LaunchAgents"
+        user_la_dir.mkdir(parents=True)
+        (user_la_dir / "com.pinglet.my-task.plist").write_text("<plist/>")
+
+        launchctl_output = '''{
+\t"Label" = "com.pinglet.my-task";
+\t"LastExitStatus" = 1;
+};
+'''
+        mock_result = MagicMock(returncode=0, stdout=launchctl_output, stderr="")
+
+        with patch("lib.task_manager.USER_LAUNCHAGENTS_DIR", user_la_dir), \
+             patch("subprocess.run", return_value=mock_result):
+            result = get_launchd_status("my-task")
+
+        assert result["installed"] is True
+        assert result["running"] is False
+        assert result["exit_code"] == 1
+        assert result["status"] == "failed"
+        assert result["disabled"] is False
+
+    def test_idle_agent(self, tmp_path):
+        """Agent loaded with exit code 0, not running -> idle."""
+        user_la_dir = tmp_path / "Library" / "LaunchAgents"
+        user_la_dir.mkdir(parents=True)
+        (user_la_dir / "com.pinglet.my-task.plist").write_text("<plist/>")
+
+        launchctl_output = '''{
+\t"Label" = "com.pinglet.my-task";
+\t"LastExitStatus" = 0;
+};
+'''
+        mock_result = MagicMock(returncode=0, stdout=launchctl_output, stderr="")
+
+        with patch("lib.task_manager.USER_LAUNCHAGENTS_DIR", user_la_dir), \
+             patch("subprocess.run", return_value=mock_result):
+            result = get_launchd_status("my-task")
+
+        assert result["installed"] is True
+        assert result["running"] is False
+        assert result["exit_code"] == 0
+        assert result["status"] == "idle"
+
+    def test_not_loaded(self, tmp_path):
+        """Agent plist exists but not loaded in launchd -> not_loaded."""
+        user_la_dir = tmp_path / "Library" / "LaunchAgents"
+        user_la_dir.mkdir(parents=True)
+        (user_la_dir / "com.pinglet.my-task.plist").write_text("<plist/>")
+
+        mock_result = MagicMock(returncode=113, stdout="", stderr="Could not find service")
+
+        with patch("lib.task_manager.USER_LAUNCHAGENTS_DIR", user_la_dir), \
+             patch("subprocess.run", return_value=mock_result):
+            result = get_launchd_status("my-task")
+
+        assert result["installed"] is True
+        assert result["status"] == "not_loaded"
+
+    def test_launchctl_timeout(self, tmp_path):
+        """launchctl times out -> unknown status with installed=True."""
+        user_la_dir = tmp_path / "Library" / "LaunchAgents"
+        user_la_dir.mkdir(parents=True)
+        (user_la_dir / "com.pinglet.my-task.plist").write_text("<plist/>")
+
+        import subprocess as sp
+
+        with patch("lib.task_manager.USER_LAUNCHAGENTS_DIR", user_la_dir), \
+             patch("subprocess.run", side_effect=sp.TimeoutExpired("launchctl", 5)):
+            result = get_launchd_status("my-task")
+
+        assert result["installed"] is True
+        assert result["status"] == "unknown"
+
+
+class TestGeneratePlistKeepAlive:
+    """Test that generate_plist includes KeepAlive configuration."""
+
+    def test_keepalive_in_plist(self):
+        plist = generate_plist("my-task", {"StartInterval": 3600})
+        assert "KeepAlive" in plist
+        assert "SuccessfulExit" in plist
+        assert "<false/>" in plist
