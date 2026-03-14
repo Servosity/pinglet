@@ -51,6 +51,24 @@ def _get_launchd_status(task_id: str) -> dict:
     return get_launchd_status(task_id)
 
 
+def _disable_task(task_id: str) -> dict:
+    """Wrapper for disable_task to allow patching."""
+    from lib.task_manager import disable_task
+    return disable_task(task_id)
+
+
+def _enable_task(task_id: str) -> dict:
+    """Wrapper for enable_task to allow patching."""
+    from lib.task_manager import enable_task
+    return enable_task(task_id)
+
+
+def _get_uid() -> str:
+    """Wrapper for _get_uid to allow patching."""
+    from lib.task_manager import _get_uid
+    return _get_uid()
+
+
 HEARTBEAT_ALERT_FILE = state_module.STATE_DIR / "_heartbeat_alerts.json"
 ALERT_COOLDOWN_HOURS = 24
 
@@ -102,6 +120,76 @@ def _should_alert_for_task(task_name: str, escalation: str, alert_state: dict) -
         return False
     except (ValueError, TypeError):
         return True
+
+
+def _attempt_auto_recovery(agent: Dict, config: dict) -> bool:
+    """Attempt to auto-recover a disabled/failed LaunchAgent.
+
+    For regular tasks (in config.tasks): disable + enable (regenerates plist).
+    For monitoring agents (healthcheck, heartbeat): bootout + bootstrap existing plist.
+
+    Returns True if recovery succeeded, False otherwise.
+    """
+    import subprocess
+    from lib.task_manager import USER_LAUNCHAGENTS_DIR
+
+    task_id = agent["task_id"]
+    label = agent["label"]
+    tasks_config = config.get("tasks", {})
+
+    if task_id in tasks_config:
+        # Regular task — use disable+enable to regenerate plist
+        log(f"Auto-recovering regular task: {task_id}", "heartbeat")
+        try:
+            _disable_task(task_id)
+            result = _enable_task(task_id)
+            if result.get("ok"):
+                log(f"Auto-recovery succeeded for {task_id}", "heartbeat")
+                return True
+            else:
+                log(f"Auto-recovery failed for {task_id}: {result.get('error')}", "heartbeat")
+                return False
+        except Exception as e:
+            log(f"Auto-recovery exception for {task_id}: {e}", "heartbeat")
+            return False
+    else:
+        # Monitoring agent — bootout + bootstrap existing plist
+        log(f"Auto-recovering monitoring agent: {task_id}", "heartbeat")
+        try:
+            uid = _get_uid()
+            plist_path = USER_LAUNCHAGENTS_DIR / f"{label}.plist"
+
+            if not plist_path.exists():
+                log(f"Cannot recover {task_id}: plist not found at {plist_path}", "heartbeat")
+                return False
+
+            # Bootout (ignore errors — may not be loaded)
+            subprocess.run(
+                ["launchctl", "bootout", f"gui/{uid}/{label}"],
+                capture_output=True,
+            )
+
+            # Bootstrap
+            result = subprocess.run(
+                ["launchctl", "bootstrap", f"gui/{uid}", str(plist_path)],
+                capture_output=True, text=True,
+            )
+
+            if result.returncode != 0:
+                log(f"Bootstrap failed for {task_id}: {result.stderr.strip()}", "heartbeat")
+                return False
+
+            # Verify recovery
+            status = _get_launchd_status(task_id)
+            if status.get("disabled"):
+                log(f"Recovery failed — {task_id} still disabled after bootstrap", "heartbeat")
+                return False
+
+            log(f"Auto-recovery succeeded for monitoring agent {task_id}", "heartbeat")
+            return True
+        except Exception as e:
+            log(f"Auto-recovery exception for {task_id}: {e}", "heartbeat")
+            return False
 
 
 def detect_disabled_agents(config: dict) -> List[Dict]:
@@ -278,20 +366,33 @@ def run_heartbeat(config: dict, wake_delay: Optional[int] = None) -> dict:
 
     log("Running heartbeat check", "heartbeat")
 
-    # Check for disabled agents first
+    # Check for disabled agents and attempt auto-recovery
     disabled = detect_disabled_agents(config)
+    auto_recovered = []
+    still_disabled = []
+
     if disabled:
         disabled_names = [d["task_id"] for d in disabled]
-        log(f"ALERT: {len(disabled)} disabled/failed agent(s): {', '.join(disabled_names)}", "heartbeat")
-        from lib.alerts import send_critical_monitoring_alert
-        send_critical_monitoring_alert(disabled)
+        log(f"Found {len(disabled)} disabled/failed agent(s): {', '.join(disabled_names)}", "heartbeat")
+
+        for agent in disabled:
+            if _attempt_auto_recovery(agent, config):
+                auto_recovered.append(agent["task_id"])
+            else:
+                still_disabled.append(agent)
+
+        if still_disabled:
+            still_names = [d["task_id"] for d in still_disabled]
+            log(f"ALERT: {len(still_disabled)} agent(s) could not be recovered: {', '.join(still_names)}", "heartbeat")
+            from lib.alerts import send_critical_monitoring_alert
+            send_critical_monitoring_alert(still_disabled)
 
     # Detect missed tasks
     missed_tasks = detect_missed_tasks(config)
 
-    if not missed_tasks and not disabled:
+    if not missed_tasks and not still_disabled:
         log("All tasks up to date", "heartbeat")
-        return {"missed_count": 0, "tasks": [], "disabled_agents": []}
+        return {"missed_count": 0, "tasks": [], "disabled_agents": [], "auto_recovered": auto_recovered}
 
     if missed_tasks:
         log(f"Found {len(missed_tasks)} missed task(s)", "heartbeat")
@@ -365,5 +466,6 @@ _Use macOS notification to Run or Ignore_"""
     return {
         "missed_count": len(missed_tasks),
         "tasks": missed_tasks,
-        "disabled_agents": disabled,
+        "disabled_agents": still_disabled,
+        "auto_recovered": auto_recovered,
     }

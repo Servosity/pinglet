@@ -135,7 +135,8 @@ class TestHeartbeatExecution:
 
         with patch("lib.heartbeat._load_state", return_value=mock_state), \
              patch("lib.heartbeat._is_ignored", return_value=False), \
-             patch("lib.heartbeat._send_missed_task_notification") as mock_notify:
+             patch("lib.heartbeat._send_missed_task_notification") as mock_notify, \
+             patch("lib.heartbeat.detect_disabled_agents", return_value=[]):
             from lib.heartbeat import run_heartbeat
 
             result = run_heartbeat(sample_config, wake_delay=0)
@@ -155,7 +156,8 @@ class TestHeartbeatExecution:
         with patch("lib.heartbeat._load_state", return_value=mock_state), \
              patch("lib.heartbeat._is_ignored", return_value=False), \
              patch("lib.heartbeat._send_missed_task_notification") as mock_notify, \
-             patch("lib.heartbeat._send_slack_message") as mock_slack:
+             patch("lib.heartbeat._send_slack_message") as mock_slack, \
+             patch("lib.heartbeat.detect_disabled_agents", return_value=[]):
             from lib.heartbeat import run_heartbeat
 
             result = run_heartbeat(sample_config, wake_delay=0)
@@ -176,6 +178,7 @@ class TestHeartbeatExecution:
              patch("lib.heartbeat._is_ignored", return_value=False), \
              patch("lib.heartbeat._send_missed_task_notification"), \
              patch("lib.heartbeat._send_slack_message"), \
+             patch("lib.heartbeat.detect_disabled_agents", return_value=[]), \
              patch("time.sleep") as mock_sleep:
             from lib.heartbeat import run_heartbeat
 
@@ -318,6 +321,117 @@ class TestEscalationLevels:
         """Zero threshold should default to warning."""
         from lib.heartbeat import get_escalation_level
         assert get_escalation_level(100, 0) == "warning"
+
+
+class TestHeartbeatAutoRecovery:
+    """Tests for auto-recovery of disabled/failed agents."""
+
+    def test_auto_recovers_regular_task(self, sample_config):
+        """Disabled regular task should be auto-recovered via disable+enable."""
+        disabled = [{"task_id": "uce", "label": "com.pinglet.uce", "exit_code": 78, "status": "disabled"}]
+
+        with patch("lib.heartbeat.detect_disabled_agents", return_value=disabled), \
+             patch("lib.heartbeat._attempt_auto_recovery", return_value=True) as mock_recover, \
+             patch("lib.heartbeat.detect_missed_tasks", return_value=[]), \
+             patch("lib.heartbeat._load_heartbeat_alert_state", return_value={}), \
+             patch("lib.heartbeat._save_heartbeat_alert_state"):
+            from lib.heartbeat import run_heartbeat
+
+            result = run_heartbeat(sample_config, wake_delay=0)
+
+            mock_recover.assert_called_once_with(disabled[0], sample_config)
+            assert "uce" in result["auto_recovered"]
+
+    def test_auto_recovery_failure_sends_alert(self, sample_config):
+        """Failed auto-recovery should trigger critical monitoring alert."""
+        disabled = [{"task_id": "uce", "label": "com.pinglet.uce", "exit_code": 78, "status": "disabled"}]
+
+        with patch("lib.heartbeat.detect_disabled_agents", return_value=disabled), \
+             patch("lib.heartbeat._attempt_auto_recovery", return_value=False), \
+             patch("lib.heartbeat.detect_missed_tasks", return_value=[]), \
+             patch("lib.heartbeat._load_heartbeat_alert_state", return_value={}), \
+             patch("lib.heartbeat._save_heartbeat_alert_state"), \
+             patch("lib.alerts.send_critical_monitoring_alert") as mock_alert:
+            from lib.heartbeat import run_heartbeat
+
+            result = run_heartbeat(sample_config, wake_delay=0)
+
+            mock_alert.assert_called_once()
+            assert "uce" not in result.get("auto_recovered", [])
+
+    def test_auto_recovers_monitoring_agent(self, sample_config):
+        """Monitoring agents (not in config.tasks) should be recovered via bootout+bootstrap."""
+        disabled = [{"task_id": "healthcheck", "label": "com.pinglet.healthcheck", "exit_code": 78, "status": "disabled"}]
+
+        with patch("lib.heartbeat.detect_disabled_agents", return_value=disabled), \
+             patch("lib.heartbeat._attempt_auto_recovery", return_value=True) as mock_recover, \
+             patch("lib.heartbeat.detect_missed_tasks", return_value=[]), \
+             patch("lib.heartbeat._load_heartbeat_alert_state", return_value={}), \
+             patch("lib.heartbeat._save_heartbeat_alert_state"):
+            from lib.heartbeat import run_heartbeat
+
+            result = run_heartbeat(sample_config, wake_delay=0)
+
+            mock_recover.assert_called_once_with(disabled[0], sample_config)
+            assert "healthcheck" in result["auto_recovered"]
+
+    def test_auto_recovery_result_in_return(self, sample_config):
+        """run_heartbeat return dict must include auto_recovered list."""
+        with patch("lib.heartbeat.detect_disabled_agents", return_value=[]), \
+             patch("lib.heartbeat.detect_missed_tasks", return_value=[]), \
+             patch("lib.heartbeat._load_heartbeat_alert_state", return_value={}), \
+             patch("lib.heartbeat._save_heartbeat_alert_state"):
+            from lib.heartbeat import run_heartbeat
+
+            result = run_heartbeat(sample_config, wake_delay=0)
+
+            assert "auto_recovered" in result
+            assert isinstance(result["auto_recovered"], list)
+
+    def test_attempt_auto_recovery_regular_task(self, sample_config):
+        """_attempt_auto_recovery should disable+enable for regular tasks."""
+        agent = {"task_id": "uce", "label": "com.pinglet.uce", "exit_code": 78, "status": "disabled"}
+
+        with patch("lib.heartbeat._disable_task", return_value={"ok": True}) as mock_dis, \
+             patch("lib.heartbeat._enable_task", return_value={"ok": True, "launchd_status": {"status": "idle"}}) as mock_en:
+            from lib.heartbeat import _attempt_auto_recovery
+
+            result = _attempt_auto_recovery(agent, sample_config)
+
+            assert result is True
+            mock_dis.assert_called_once_with("uce")
+            mock_en.assert_called_once_with("uce")
+
+    def test_attempt_auto_recovery_monitoring_agent(self, sample_config):
+        """_attempt_auto_recovery should bootout+bootstrap for monitoring agents."""
+        agent = {"task_id": "healthcheck", "label": "com.pinglet.healthcheck", "exit_code": 78, "status": "disabled"}
+
+        with patch("subprocess.run") as mock_run, \
+             patch("lib.heartbeat._get_uid", return_value="501"), \
+             patch("lib.heartbeat._get_launchd_status", return_value={
+                 "installed": True, "running": False, "exit_code": 0,
+                 "disabled": False, "status": "idle",
+             }):
+            mock_run.return_value = MagicMock(returncode=0)
+            from lib.heartbeat import _attempt_auto_recovery
+
+            result = _attempt_auto_recovery(agent, sample_config)
+
+            assert result is True
+            # Should have called bootout then bootstrap
+            assert mock_run.call_count == 2
+
+    def test_attempt_auto_recovery_failure(self, sample_config):
+        """_attempt_auto_recovery returns False when enable_task fails."""
+        agent = {"task_id": "uce", "label": "com.pinglet.uce", "exit_code": 78, "status": "disabled"}
+
+        with patch("lib.heartbeat._disable_task", return_value={"ok": True}), \
+             patch("lib.heartbeat._enable_task", return_value={"ok": False, "error": "still broken"}):
+            from lib.heartbeat import _attempt_auto_recovery
+
+            result = _attempt_auto_recovery(agent, sample_config)
+
+            assert result is False
 
 
 class TestHeartbeatAlertCooldown:

@@ -789,6 +789,7 @@ SCHEDULE SYNTAX:
   every 3600s                Every 3600 seconds
   daily 7:00                 Daily at 7:00 AM
   daily 7:00,19:00           Daily at 7 AM and 7 PM
+  hourly :22                 Every hour at :22 past
   weekly mon 7:33            Weekly on Monday at 7:33 AM
 
 OUTPUT:

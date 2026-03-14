@@ -190,6 +190,8 @@ def load_all_states() -> list:
     states = []
 
     for state_file in STATE_DIR.glob("*.json"):
+        if state_file.name.startswith("_"):
+            continue
         task_name = state_file.stem
         states.append(load_state(task_name))
 

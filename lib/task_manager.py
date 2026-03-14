@@ -56,6 +56,7 @@ def parse_schedule(schedule_spec: str) -> dict:
         "every 3600s"       -> {"StartInterval": 3600}
         "daily 7:00"        -> {"StartCalendarInterval": {"Hour": 7, "Minute": 0}}
         "daily 7:00,19:00"  -> {"StartCalendarInterval": [{"Hour": 7, ...}, {"Hour": 19, ...}]}
+        "hourly :22"        -> {"StartCalendarInterval": {"Minute": 22}}
         "weekly mon 7:33"   -> {"StartCalendarInterval": {"Weekday": 1, "Hour": 7, "Minute": 33}}
     """
     spec = schedule_spec.strip().lower()
@@ -67,6 +68,14 @@ def parse_schedule(schedule_spec: str) -> dict:
         unit = every_match.group(2)
         multiplier = {"s": 1, "m": 60, "h": 3600}[unit]
         return {"StartInterval": value * multiplier}
+
+    # Pattern: "hourly :MM" — run at specific minute each hour
+    hourly_match = re.match(r"^hourly\s+:(\d{1,2})$", spec)
+    if hourly_match:
+        minute = int(hourly_match.group(1))
+        if not (0 <= minute <= 59):
+            raise ValueError(f"Minute must be 0-59, got {minute}")
+        return {"StartCalendarInterval": {"Minute": minute}}
 
     # Pattern: "daily <time>[,<time>...]"
     daily_match = re.match(r"^daily\s+(.+)$", spec)
@@ -134,6 +143,10 @@ def schedule_to_human(schedule_dict: dict) -> str:
         day = WEEKDAY_REVERSE.get(cal["Weekday"], str(cal["Weekday"]))
         return f"weekly {day} {cal['Hour']}:{cal['Minute']:02d}"
 
+    # Hourly — only Minute key, no Hour
+    if "Minute" in cal and "Hour" not in cal:
+        return f"hourly :{cal['Minute']:02d}"
+
     return f"daily {cal['Hour']}:{cal['Minute']:02d}"
 
 
@@ -149,6 +162,8 @@ def estimate_expected_interval(schedule_dict: dict) -> Optional[float]:
     if isinstance(cal, dict):
         if "Weekday" in cal:
             return 180  # ~7.5 days
+        if "Minute" in cal and "Hour" not in cal:
+            return 1.5  # hourly + grace
         return 26  # 24h + 2h grace
 
     # Array of calendar intervals — estimate max gap
@@ -559,7 +574,26 @@ def enable_task(task_id: str, schedule_spec: str = None) -> dict:
     except Exception as e:
         return {"ok": False, "error": f"Failed to install LaunchAgent: {e}"}
 
-    return {"ok": True, "task_id": task_id, "plist": str(plist_path), "schedule": schedule_to_human(schedule_dict)}
+    # Verify launchd accepted the config
+    launchd_status = get_launchd_status(task_id)
+    if launchd_status.get("disabled"):
+        # Launchd rejected — clean up and report error
+        label = f"com.pinglet.{task_id}"
+        uid = _get_uid()
+        subprocess.run(["launchctl", "bootout", f"gui/{uid}/{label}"], capture_output=True)
+        return {
+            "ok": False,
+            "error": f"LaunchAgent rejected by launchd (exit {launchd_status.get('exit_code')}). "
+                     "Check plist for invalid config (e.g. KeepAlive + StartCalendarInterval).",
+            "task_id": task_id,
+            "launchd_status": launchd_status,
+        }
+
+    return {
+        "ok": True, "task_id": task_id, "plist": str(plist_path),
+        "schedule": schedule_to_human(schedule_dict),
+        "launchd_status": launchd_status,
+    }
 
 
 def disable_task(task_id: str) -> dict:

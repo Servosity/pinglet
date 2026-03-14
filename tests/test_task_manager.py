@@ -17,6 +17,7 @@ from lib.task_manager import (
     generate_plist,
     estimate_expected_interval,
     get_launchd_status,
+    enable_task,
     _parse_time,
     _deep_merge,
 )
@@ -525,9 +526,12 @@ class TestEnableDisable:
              patch("lib.task_manager.LAUNCHAGENTS_DIR", la_dir), \
              patch("lib.task_manager.USER_LAUNCHAGENTS_DIR", user_la_dir), \
              patch("subprocess.run") as mock_run, \
-             patch("lib.task_manager._get_uid", return_value="501"):
-            mock_run.return_value = MagicMock(returncode=0, stderr="")
-            from lib.task_manager import enable_task
+             patch("lib.task_manager._get_uid", return_value="501"), \
+             patch("lib.task_manager.get_launchd_status", return_value={
+                 "installed": True, "running": False, "exit_code": 0,
+                 "disabled": False, "status": "idle",
+             }):
+            mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
             result = enable_task("uce")
 
         assert result["ok"] is True
@@ -576,6 +580,82 @@ class TestEnableDisable:
 
         assert result["ok"] is True
         assert "Already disabled" in result["note"]
+
+
+class TestEnableTaskVerification:
+    """Tests for post-install verification in enable_task()."""
+
+    def _make_config(self, tmp_path, sample_config):
+        sample_config["tasks"]["uce"]["schedule"] = "daily 7:00,19:00"
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+        la_dir = tmp_path / "launchagents"
+        la_dir.mkdir()
+        user_la_dir = tmp_path / "Library" / "LaunchAgents"
+        user_la_dir.mkdir(parents=True)
+        return config_path, la_dir, user_la_dir
+
+    def test_enable_returns_launchd_status(self, tmp_path, sample_config):
+        """enable_task() should include launchd_status in its return dict."""
+        config_path, la_dir, user_la_dir = self._make_config(tmp_path, sample_config)
+        launchd_status = {
+            "installed": True, "running": False, "exit_code": 0,
+            "disabled": False, "status": "idle",
+        }
+
+        with patch("lib.task_manager.CONFIG_PATH", config_path), \
+             patch("lib.task_manager.LAUNCHAGENTS_DIR", la_dir), \
+             patch("lib.task_manager.USER_LAUNCHAGENTS_DIR", user_la_dir), \
+             patch("subprocess.run") as mock_run, \
+             patch("lib.task_manager._get_uid", return_value="501"), \
+             patch("lib.task_manager.get_launchd_status", return_value=launchd_status):
+            mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+            result = enable_task("uce")
+
+        assert result["ok"] is True
+        assert "launchd_status" in result
+        assert result["launchd_status"]["status"] == "idle"
+
+    def test_enable_fails_on_exit_78(self, tmp_path, sample_config):
+        """enable_task() should return ok=False when launchd rejects with exit 78."""
+        config_path, la_dir, user_la_dir = self._make_config(tmp_path, sample_config)
+        launchd_status = {
+            "installed": True, "running": False, "exit_code": 78,
+            "disabled": True, "status": "disabled",
+        }
+
+        with patch("lib.task_manager.CONFIG_PATH", config_path), \
+             patch("lib.task_manager.LAUNCHAGENTS_DIR", la_dir), \
+             patch("lib.task_manager.USER_LAUNCHAGENTS_DIR", user_la_dir), \
+             patch("subprocess.run") as mock_run, \
+             patch("lib.task_manager._get_uid", return_value="501"), \
+             patch("lib.task_manager.get_launchd_status", return_value=launchd_status):
+            mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+            result = enable_task("uce")
+
+        assert result["ok"] is False
+        assert "rejected" in result["error"].lower() or "disabled" in result["error"].lower()
+        assert result["launchd_status"]["disabled"] is True
+
+    def test_enable_ok_on_failed_status(self, tmp_path, sample_config):
+        """enable_task() should return ok=True when status is 'failed' (not 'disabled')."""
+        config_path, la_dir, user_la_dir = self._make_config(tmp_path, sample_config)
+        launchd_status = {
+            "installed": True, "running": False, "exit_code": 1,
+            "disabled": False, "status": "failed",
+        }
+
+        with patch("lib.task_manager.CONFIG_PATH", config_path), \
+             patch("lib.task_manager.LAUNCHAGENTS_DIR", la_dir), \
+             patch("lib.task_manager.USER_LAUNCHAGENTS_DIR", user_la_dir), \
+             patch("subprocess.run") as mock_run, \
+             patch("lib.task_manager._get_uid", return_value="501"), \
+             patch("lib.task_manager.get_launchd_status", return_value=launchd_status):
+            mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+            result = enable_task("uce")
+
+        assert result["ok"] is True
+        assert result["launchd_status"]["status"] == "failed"
 
 
 class TestSetSchedule:
@@ -776,3 +856,16 @@ class TestGeneratePlistKeepAlive:
         assert "KeepAlive" in plist
         assert "SuccessfulExit" in plist
         assert "<false/>" in plist
+
+    def test_no_keepalive_for_calendar_interval(self):
+        """Regression: KeepAlive + StartCalendarInterval causes launchd exit 78."""
+        plist = generate_plist("my-task", {"StartCalendarInterval": {"Hour": 7, "Minute": 0}})
+        assert "KeepAlive" not in plist
+
+    def test_no_keepalive_for_calendar_interval_array(self):
+        """Regression: array form of StartCalendarInterval must also exclude KeepAlive."""
+        plist = generate_plist("my-task", {"StartCalendarInterval": [
+            {"Hour": 7, "Minute": 0},
+            {"Hour": 19, "Minute": 0},
+        ]})
+        assert "KeepAlive" not in plist

@@ -12,7 +12,7 @@ from typing import Optional
 # Resolve project root
 PROJECT_ROOT = Path(__file__).parent.parent
 STATE_DIR = PROJECT_ROOT / "state"
-IGNORED_FILE = STATE_DIR / "ignored.json"
+IGNORED_FILE = STATE_DIR / "_ignored.json"
 
 
 def ensure_state_dir() -> None:
