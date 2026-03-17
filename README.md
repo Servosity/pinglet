@@ -21,7 +21,7 @@ Think of it like pods in Kubernetes or containers in Docker — "pinglet" is the
 Run `--help` for the full CLI reference in one call:
 
 ```bash
-/path/to/pinglet/venv/bin/python /path/to/pinglet/pinglet.py --help
+./venv/bin/python ./pinglet.py --help
 ```
 
 All management commands output JSON to stdout. Parse `ok` field for success/failure.
@@ -29,7 +29,7 @@ All management commands output JSON to stdout. Parse `ok` field for success/fail
 ### Quick Reference
 
 ```bash
-P="/path/to/pinglet/venv/bin/python /path/to/pinglet/pinglet.py"
+P="./venv/bin/python ./pinglet.py"
 
 # List all tasks (JSON)
 $P --list --json
@@ -111,6 +111,9 @@ $P --task-logs my-task 200  # more log lines if needed
 ## Quick Start
 
 ```bash
+# After cloning — install pre-commit hook
+bash scripts/install-hooks.sh
+
 # Run a pinglet
 ./venv/bin/python pinglet.py --task uce
 

@@ -34,6 +34,9 @@ Spec.md
 # Claude Code local settings
 .claude/
 
+# Git backup (from history rewrites)
+.git-backup/
+
 # macOS
 .DS_Store
 

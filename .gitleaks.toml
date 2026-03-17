@@ -1,0 +1,74 @@
+# Gitleaks configuration for pinglet
+# Extends default rules with custom PII detection
+
+title = "Pinglet Security Rules"
+
+# Custom rules for PII detection
+[[rules]]
+id = "personal-home-path-macos"
+description = "macOS personal home directory path"
+regex = '''/Users/[a-zA-Z][a-zA-Z0-9._-]+/'''
+tags = ["pii", "path"]
+
+[[rules]]
+id = "personal-home-path-linux"
+description = "Linux personal home directory path"
+regex = '''/home/[a-zA-Z][a-zA-Z0-9._-]+/'''
+tags = ["pii", "path"]
+
+[[rules]]
+id = "slack-dm-channel-id"
+description = "Slack DM channel ID"
+regex = '''D[A-Z0-9]{8,}'''
+tags = ["pii", "slack"]
+
+[[rules]]
+id = "slack-user-token"
+description = "Slack user token"
+regex = '''xoxp-[0-9a-zA-Z-]+'''
+tags = ["secret", "slack"]
+
+[[rules]]
+id = "slack-bot-token"
+description = "Slack bot token"
+regex = '''xoxb-[0-9a-zA-Z-]+'''
+tags = ["secret", "slack"]
+
+[[rules]]
+id = "slack-session-token"
+description = "Slack session token"
+regex = '''xoxs-[0-9a-zA-Z-]+'''
+tags = ["secret", "slack"]
+
+[[rules]]
+id = "slack-app-token"
+description = "Slack app token"
+regex = '''xapp-[0-9a-zA-Z-]+'''
+tags = ["secret", "slack"]
+
+[[rules]]
+id = "anthropic-api-key"
+description = "Anthropic API key"
+regex = '''sk-ant-[a-zA-Z0-9-]+'''
+tags = ["secret", "api"]
+
+[[rules]]
+id = "github-pat"
+description = "GitHub personal access token"
+regex = '''ghp_[a-zA-Z0-9]{36,}'''
+tags = ["secret", "github"]
+
+[[rules]]
+id = "github-oauth"
+description = "GitHub OAuth token"
+regex = '''gho_[a-zA-Z0-9]{36,}'''
+tags = ["secret", "github"]
+
+# Allowlist - files that are expected to contain patterns
+[allowlist]
+paths = [
+    '''\.gitleaks\.toml$''',
+    '''scripts/pre-commit$''',
+    '''\.env\.example$''',
+    '''launchagents/.*\.example\.plist$''',
+]
