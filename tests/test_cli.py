@@ -17,6 +17,7 @@ class MockTaskState:
     last_run: str = None
     last_status: str = "never_run"
     consecutive_failures: int = 0
+    last_error: str = None
 
 
 class TestRunNowCommand:
@@ -236,3 +237,137 @@ class TestUninstallHeartbeatCommand:
             result = uninstall_heartbeat()
 
             assert result == 0
+
+
+class TestStatusCommand:
+    """Tests for --status CLI command."""
+
+    def test_status_returns_json(self, sample_config):
+        """Test --status outputs valid JSON with required top-level keys."""
+        with patch("lib.task_manager.load_config", return_value=sample_config), \
+             patch("lib.task_manager.get_launchd_status", return_value={
+                 "installed": True, "running": False, "exit_code": 0, "disabled": False, "status": "idle"
+             }), \
+             patch("lib.task_manager.load_state", return_value=MockTaskState(
+                 task_name="uce", last_run=datetime.now().isoformat(), last_status="success"
+             )), \
+             patch("lib.task_manager.is_task_enabled", return_value=True), \
+             patch("lib.heartbeat._load_monitoring_down_state", return_value={}), \
+             patch("lib.heartbeat._load_heartbeat_alert_state", return_value={}), \
+             patch("lib.heartbeat._load_learning_state", return_value={"version": 1, "agents": {}, "tasks": {}}):
+            from lib.task_manager import get_system_status
+
+            status = get_system_status()
+
+            assert "ok" in status
+            assert "healthy" in status
+            assert "timestamp" in status
+            assert "summary" in status
+            assert "monitoring" in status
+            assert "tasks" in status
+            assert "alerts" in status
+            assert "learning" in status
+            assert "issues" in status
+            assert "defaults" in status
+
+    def test_status_monitoring_section(self, sample_config):
+        """Test --status includes monitoring agent health."""
+        def mock_launchd(task_id):
+            if task_id == "healthcheck":
+                return {"installed": True, "running": False, "exit_code": 78, "disabled": True, "status": "disabled"}
+            return {"installed": True, "running": False, "exit_code": 0, "disabled": False, "status": "idle"}
+
+        with patch("lib.task_manager.load_config", return_value=sample_config), \
+             patch("lib.task_manager.get_launchd_status", side_effect=mock_launchd), \
+             patch("lib.task_manager.load_state", return_value=MockTaskState(
+                 task_name="any", last_run=datetime.now().isoformat(), last_status="success"
+             )), \
+             patch("lib.task_manager.is_task_enabled", return_value=True), \
+             patch("lib.heartbeat._load_monitoring_down_state", return_value={}), \
+             patch("lib.heartbeat._load_heartbeat_alert_state", return_value={}), \
+             patch("lib.heartbeat._load_learning_state", return_value={"version": 1, "agents": {}, "tasks": {}}):
+            from lib.task_manager import get_system_status
+
+            status = get_system_status()
+
+            assert status["monitoring"]["healthcheck"]["healthy"] is False
+            assert status["monitoring"]["heartbeat"]["healthy"] is True
+
+    def test_status_exit_code_unhealthy(self, sample_config):
+        """Test --status returns exit 1 when system is unhealthy."""
+        def mock_launchd(task_id):
+            return {"installed": True, "running": False, "exit_code": 78, "disabled": True, "status": "disabled"}
+
+        with patch("lib.task_manager.load_config", return_value=sample_config), \
+             patch("lib.task_manager.get_launchd_status", side_effect=mock_launchd), \
+             patch("lib.task_manager.load_state", return_value=MockTaskState(
+                 task_name="any", last_run=datetime.now().isoformat(), last_status="success"
+             )), \
+             patch("lib.task_manager.is_task_enabled", return_value=True), \
+             patch("lib.heartbeat._load_monitoring_down_state", return_value={}), \
+             patch("lib.heartbeat._load_heartbeat_alert_state", return_value={}), \
+             patch("lib.heartbeat._load_learning_state", return_value={"version": 1, "agents": {}, "tasks": {}}):
+            from lib.task_manager import get_system_status
+
+            status = get_system_status()
+            assert status["ok"] is False
+
+    def test_status_includes_alert_state(self, sample_config):
+        """Test --status includes current alert state."""
+        alert_state = {"uce": {"last_alert": "2026-03-17T08:00:00", "escalation": "warning"}}
+
+        with patch("lib.task_manager.load_config", return_value=sample_config), \
+             patch("lib.task_manager.get_launchd_status", return_value={
+                 "installed": True, "running": False, "exit_code": 0, "disabled": False, "status": "idle"
+             }), \
+             patch("lib.task_manager.load_state", return_value=MockTaskState(
+                 task_name="any", last_run=datetime.now().isoformat(), last_status="success"
+             )), \
+             patch("lib.task_manager.is_task_enabled", return_value=True), \
+             patch("lib.heartbeat._load_monitoring_down_state", return_value={}), \
+             patch("lib.heartbeat._load_heartbeat_alert_state", return_value=alert_state), \
+             patch("lib.heartbeat._load_learning_state", return_value={"version": 1, "agents": {}, "tasks": {}}):
+            from lib.task_manager import get_system_status
+
+            status = get_system_status()
+            assert status["alerts"]["heartbeat_cooldowns"] == alert_state
+
+    def test_status_includes_learning_state(self, sample_config):
+        """Test --status includes learning patterns."""
+        learning = {
+            "version": 1,
+            "agents": {
+                "clawdbot-sync": {
+                    "pattern": "chronic_cycle",
+                    "suppressed": True,
+                    "effective_threshold": 10,
+                    "total_detections": 47,
+                    "total_auto_recoveries": 47,
+                    "total_llm_recoveries": 0,
+                    "total_human_alerts": 0,
+                    "consecutive_auto_recoveries": 47,
+                    "last_detection": "2026-03-17T07:00:00",
+                    "known_issues": [],
+                    "suppressed_reason": "chronic",
+                }
+            },
+            "tasks": {},
+        }
+
+        with patch("lib.task_manager.load_config", return_value=sample_config), \
+             patch("lib.task_manager.get_launchd_status", return_value={
+                 "installed": True, "running": False, "exit_code": 0, "disabled": False, "status": "idle"
+             }), \
+             patch("lib.task_manager.load_state", return_value=MockTaskState(
+                 task_name="any", last_run=datetime.now().isoformat(), last_status="success"
+             )), \
+             patch("lib.task_manager.is_task_enabled", return_value=True), \
+             patch("lib.heartbeat._load_monitoring_down_state", return_value={}), \
+             patch("lib.heartbeat._load_heartbeat_alert_state", return_value={}), \
+             patch("lib.heartbeat._load_learning_state", return_value=learning):
+            from lib.task_manager import get_system_status
+
+            status = get_system_status()
+            assert "clawdbot-sync" in status["learning"]
+            assert status["learning"]["clawdbot-sync"]["pattern"] == "chronic_cycle"
+            assert status["learning"]["clawdbot-sync"]["suppressed"] is True

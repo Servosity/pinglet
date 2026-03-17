@@ -210,6 +210,180 @@ Staleness alerts escalate based on how far past the threshold a task is:
 
 Generated plists include `KeepAlive > SuccessfulExit: false` so launchd restarts agents that exit non-zero instead of permanently disabling them. The heartbeat agent uses `KeepAlive: true` for maximum resilience.
 
+## Adaptive Loop
+
+Pinglet implements a detection-recovery-learning flywheel that reduces human intervention over time:
+
+```
+          +------------------+
+          |   Task Failure   |
+          |   (exit != 0)    |
+          +--------+---------+
+                   |
+                   v
+          +------------------+
+          | Tier 1: Auto-    |<---------+
+          | Recovery         |          |
+          | (bootout+boot)   |          |
+          +--------+---------+          |
+                   |                    |
+            recovered?                  |
+           /          \                 |
+         yes           no              |
+          |             |               |
+          v             v               |
+   +-----------+  +------------------+  |
+   | Learning  |  | Tier 2: LLM     |  |
+   | Loop      |  | Self-Diagnosis  |  |
+   | (pattern  |  | (claude -p)     |  |
+   |  update)  |  +--------+--------+  |
+   +-----------+           |            |
+                     fixed?             |
+                    /      \            |
+                  yes       no          |
+                   |         |          |
+                   v         v          |
+            +-----------+  +----------+ |
+            | Learning  |  | Tier 3:  | |
+            | Loop      |  | Human    | |
+            | (pattern  |  | Alert    | |
+            |  update)  |  | (Slack/  | |
+            +-----------+  | macOS)   | |
+                           +----+-----+ |
+                                |       |
+                                +-------+
+```
+
+### Recovery Cascade
+
+Three tiers execute in order. Each tier only fires if the previous one failed.
+
+| Tier | Action | Trigger |
+|------|--------|---------|
+| 1 | Auto-recovery (bootout + bootstrap) | Every detection of a disabled/failed agent |
+| 2 | LLM self-diagnosis (`claude -p`) | After auto-recovery fails once |
+| 3 | Human alert (Slack + macOS) | After `consecutive_detections >= monitoring_alert_threshold` (default: 3) |
+
+### Learning Loop
+
+The heartbeat tracks failure patterns per task in `state/_learning.json` and adapts thresholds automatically.
+
+**Detected patterns:**
+
+| Pattern | Meaning | Adaptation |
+|---------|---------|------------|
+| `chronic_cycle` | Fails, recovers, fails again repeatedly | Higher alert threshold, `suppressed=true` |
+| `intermittent` | Occasional failures with long healthy stretches | Default thresholds maintained |
+| `persistent` | Fails and stays failed across multiple checks | Lower alert threshold for faster escalation |
+
+**Noise suppression:** Tasks classified as `chronic_cycle` auto-recoverers are marked `suppressed=true`. They still auto-recover but no longer generate human alerts unless the pattern changes.
+
+**Threshold adaptation:** The learning loop adjusts each task's effective `monitoring_alert_threshold` based on its pattern. Chronic cyclers get a higher threshold (fewer alerts); persistent failures get a lower threshold (faster escalation).
+
+### Default Values
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `retry_max_attempts` | 3 | Retries before declaring failure |
+| `retry_delays_seconds` | [10, 60, 300] | Exponential backoff delays |
+| `consecutive_failures_before_alert` | 3 | Failures before alerting |
+| `alert_cooldown_minutes` | 30 | Min time between alerts |
+| `monitoring_alert_threshold` | 3 | Detections before human alert |
+| `monitoring_alert_cooldown_hours` | 24 | Cooldown for monitoring alerts |
+| `on_failure_timeout` | 180 | Seconds for on_failure callback |
+| `on_failure_max_turns` | 5 | Max LLM turns |
+| `on_failure_max_budget_usd` | 2.00 | Max spend per callback |
+| `self_diagnosis_max_budget_usd` | 1.00 | Max spend per self-diagnosis |
+
+### `on_failure` Callback
+
+When a task fails, Pinglet can invoke an external command (typically an LLM) to diagnose and fix the issue before alerting a human.
+
+**Config (config.yaml):**
+
+```yaml
+tasks:
+  my-task:
+    command: ./run.py
+    on_failure:
+      command: claude
+      args:
+        - "-p"
+        - "Task {task_id} failed (exit {exit_code}). Read {stderr_file}. Check {learning_file}. Fix if possible."
+      timeout: 180
+      max_turns: 5
+      max_budget_usd: 2.00
+```
+
+**CLI flags:**
+
+```bash
+$P --task-add my-task --command ./run.py \
+  --on-failure-command claude \
+  --on-failure-prompt "Task {task_id} failed (exit {exit_code}). Read {stderr_file}. Fix if possible." \
+  --on-failure-timeout 180 \
+  --on-failure-max-turns 5
+```
+
+**Template variables** available in `on_failure` prompts:
+
+| Variable | Description |
+|----------|-------------|
+| `{task_id}` | Task identifier |
+| `{task_name}` | Display name |
+| `{exit_code}` | Process exit code |
+| `{error}` | Error message (if captured) |
+| `{log_file}` | Path to combined log file |
+| `{stderr_file}` | Path to stderr capture |
+| `{stdout_file}` | Path to stdout capture |
+| `{working_dir}` | Task working directory |
+| `{consecutive_failures}` | Current failure streak count |
+| `{state_file}` | Path to task state JSON |
+| `{project_root}` | Pinglet install directory |
+| `{learning_file}` | Path to `state/_learning.json` |
+
+**Exit code contract:** The callback should exit `0` if it fixed the problem (Pinglet will retry the task), or `1` if human intervention is needed (Pinglet proceeds to alert).
+
+### `--status` API
+
+The `--status` command returns a JSON overview of all tasks, the adaptive loop state, and recent activity:
+
+```bash
+./venv/bin/python pinglet.py --status
+```
+
+Example output (abbreviated):
+
+```json
+{
+  "ok": true,
+  "summary": {
+    "total_tasks": 4,
+    "healthy": 3,
+    "failing": 1,
+    "disabled": 0
+  },
+  "adaptive_loop": {
+    "learning_file": "state/_learning.json",
+    "patterns": {
+      "uce": {"pattern": "intermittent", "suppressed": false},
+      "git-sync": {"pattern": "chronic_cycle", "suppressed": true}
+    },
+    "auto_recoveries_24h": 2,
+    "human_alerts_24h": 0
+  },
+  "tasks": [
+    {
+      "id": "uce",
+      "status": "IDLE",
+      "last_run": "2026-03-17T07:00:12Z",
+      "last_exit_code": 0,
+      "consecutive_failures": 0
+    }
+  ]
+}
+```
+
 ## Missed Pinglet Detection
 
 Pinglet detects when scheduled pinglets haven't run (e.g., laptop was asleep) and notifies with actionable options.
@@ -364,8 +538,10 @@ pinglet/
 │   ├── ignored.py          # Ignored pinglets management
 │   ├── queue.py            # Pinglet queue for sequential execution
 │   └── output_formatter.py # Output formatting (JSON/text)
-├── tests/                  # Test suite (175 tests)
+├── tests/                  # Test suite (220 tests)
 ├── state/                  # Per-task state files (*.json)
+│   ├── _learning.json      # Adaptive loop pattern history
+│   └── _monitoring_down_state.json  # Monitoring agent down-state tracking
 ├── logs/                   # Log files
 └── launchagents/           # Generated LaunchAgent plists
 ```

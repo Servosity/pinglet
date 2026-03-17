@@ -175,6 +175,13 @@ def run_task(task_name: str) -> int:
         if should_alert:
             # Reload state to get current consecutive_failures count
             current_state = load_state(task_name)
+
+            # Run on_failure callback if configured
+            llm_result = _run_on_failure_callback(
+                task_name, task_config, exit_code, error_message,
+                current_state.consecutive_failures,
+            )
+
             send_critical(
                 task_name=display_name,
                 error=error_message,
@@ -186,6 +193,7 @@ def run_task(task_name: str) -> int:
                 },
                 log_file=str(get_log_file_path()),
                 task_id=task_name,
+                llm_result=llm_result if llm_result.get("invoked") else None,
             )
             reliability.record_alert_sent()
 
@@ -637,6 +645,16 @@ def _build_task_config_from_args(args) -> dict:
     # Inline schedule
     if args.schedule_spec:
         config["schedule"] = args.schedule_spec
+    # on_failure callback
+    if args.on_failure_command:
+        on_failure = {"command": args.on_failure_command}
+        if args.on_failure_prompt:
+            on_failure["args"] = ["-p", args.on_failure_prompt]
+        if args.on_failure_timeout:
+            on_failure["timeout"] = args.on_failure_timeout
+        if args.on_failure_max_turns:
+            on_failure["max_turns"] = args.on_failure_max_turns
+        config["on_failure"] = on_failure
     return config
 
 
@@ -766,7 +784,8 @@ EXECUTION:
   --run-now TASK             Run a missed pinglet immediately
   --ignore TASK              Mark missed pinglet as ignored
   --healthcheck, -H          Run daily health summary
-  --heartbeat                Check for missed pinglets
+  --heartbeat                Check for missed pinglets (3-tier recovery cascade)
+  --status                   System status JSON (agent-parseable)
   --test-alerts              Test Slack + macOS notifications
   --install-heartbeat        Install heartbeat LaunchAgent
   --uninstall-heartbeat      Uninstall heartbeat LaunchAgent
@@ -782,6 +801,10 @@ CONFIG FLAGS (use with --task-add or --task-edit):
   --summary-template TEXT    Template for JSON output (e.g. "Processed {count} items")
   --failures-before-alert N  Consecutive failures before alerting (default: 3)
   --schedule-spec SPEC       Schedule (inline with add/edit, see syntax below)
+  --on-failure-command CMD   Command to run on failure (e.g. 'claude')
+  --on-failure-prompt TEXT   Prompt for on_failure (supports {template_vars})
+  --on-failure-timeout SECS  Timeout for on_failure callback (default: 180)
+  --on-failure-max-turns N   Max turns for on_failure LLM (default: 5)
 
 SCHEDULE SYNTAX:
   every 1h                   Every hour (StartInterval)
@@ -827,6 +850,18 @@ EXAMPLES:
 """
 
 
+def run_status() -> int:
+    """Output structured JSON status for the entire system.
+
+    Designed for agent consumption: any LLM or script can parse this
+    to understand pinglet health at a glance.
+    """
+    from lib.task_manager import get_system_status
+    status = get_system_status()
+    print(json.dumps(status, indent=2))
+    return 0 if status.get("ok", False) else 1
+
+
 def _check_monitoring_agents() -> list:
     """Check if monitoring agents (healthcheck, heartbeat) are dead.
 
@@ -854,43 +889,143 @@ def _check_monitoring_agents() -> list:
 
 
 def _maybe_send_monitoring_alert(dead_agents: list) -> None:
-    """Send a debounced Slack alert if monitoring agents are dead.
+    """Monitoring alerts now handled by heartbeat's 3-tier cascade.
 
-    Only re-alerts after 24h or if the set of dead agents changed.
-    Uses state/_monitoring_alert.json for debounce tracking.
+    This function is kept for backward compatibility with the
+    'every CLI invocation' self-check, but only logs a warning.
+    The actual alerting + recovery happens in run_heartbeat().
     """
     if not dead_agents:
         return
+    # Just log — the heartbeat cascade handles thresholds, auto-recovery,
+    # LLM diagnosis, and human alerting with learning-based suppression.
+    from lib.logging import log
+    log(f"Monitoring self-check: {len(dead_agents)} dead agent(s) detected. Next heartbeat will handle recovery.", "pinglet")
 
-    from lib.state import STATE_DIR
-    alert_file = STATE_DIR / "_monitoring_alert.json"
-    now = datetime.now()
-    dead_set = sorted(dead_agents)
 
-    # Check debounce
-    if alert_file.exists():
+def _run_on_failure_callback(task_name: str, task_config: dict, exit_code: int,
+                              error: str, consecutive_failures: int) -> dict:
+    """Run an on_failure callback if configured for this task.
+
+    Substitutes template variables into the callback args, builds a
+    command with best-practice flags for claude -p, and runs it.
+
+    Returns:
+        {"invoked": bool, "exit_code": int|None, "output": str, "log_file": str|None}
+    """
+    on_failure = task_config.get("on_failure")
+    if not on_failure:
+        return {"invoked": False, "exit_code": None, "output": "", "log_file": None}
+
+    callback_cmd = on_failure.get("command", "")
+    callback_args = on_failure.get("args", [])
+    callback_timeout = on_failure.get("timeout", 180)
+    callback_max_turns = on_failure.get("max_turns", 5)
+    callback_max_budget = on_failure.get("max_budget_usd", 2.00)
+    callback_allowed_tools = on_failure.get("allowed_tools", "Read,Bash,Edit")
+    callback_working_dir = on_failure.get("working_dir", str(PROJECT_ROOT))
+
+    logs_dir = PROJECT_ROOT / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    learning_file = PROJECT_ROOT / "state" / "_learning.json"
+
+    # Template variables
+    template_vars = {
+        "task_id": task_name,
+        "task_name": task_config.get("name", task_name),
+        "exit_code": str(exit_code),
+        "error": (error or "")[:500],
+        "log_file": str(PROJECT_ROOT / "logs" / "pinglet.log"),
+        "stderr_file": str(logs_dir / f"{task_name}.err"),
+        "stdout_file": str(logs_dir / f"{task_name}.log"),
+        "working_dir": task_config.get("working_dir", str(PROJECT_ROOT)),
+        "consecutive_failures": str(consecutive_failures),
+        "state_file": str(PROJECT_ROOT / "state" / f"{task_name}.json"),
+        "project_root": str(PROJECT_ROOT),
+        "learning_file": str(learning_file),
+    }
+
+    # Substitute template variables in args
+    resolved_args = []
+    for arg in callback_args:
+        resolved = str(arg)
+        for key, value in template_vars.items():
+            resolved = resolved.replace("{" + key + "}", value)
+        resolved_args.append(resolved)
+
+    # Build full command
+    cmd = [callback_cmd] + resolved_args
+
+    # Add best-practice flags for claude -p invocations
+    if callback_cmd in ("claude", "/opt/homebrew/bin/claude"):
+        extra_flags = [
+            "--allowedTools", callback_allowed_tools,
+            "--output-format", "json",
+            "--max-turns", str(callback_max_turns),
+            "--max-budget-usd", str(callback_max_budget),
+            "--no-session-persistence",
+        ]
+        # Insert flags after the -p argument
+        cmd.extend(extra_flags)
+
+    log_file_path = logs_dir / f"{task_name}-on_failure.log"
+
+    log(f"Running on_failure callback for {task_name}: {' '.join(cmd[:5])}...", task_name)
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=callback_timeout,
+            cwd=callback_working_dir,
+        )
+
+        # Log full output
+        with open(log_file_path, "w") as f:
+            f.write(f"Exit code: {result.returncode}\n")
+            f.write(f"Command: {' '.join(cmd)}\n")
+            f.write(f"Timestamp: {datetime.now().isoformat()}\n")
+            f.write(f"\n--- STDOUT ---\n{result.stdout}\n")
+            f.write(f"\n--- STDERR ---\n{result.stderr}\n")
+
+        # Parse JSON output if available
+        output_summary = ""
         try:
-            with open(alert_file, "r") as f:
-                prev = json.load(f)
-            prev_agents = sorted(prev.get("agents", []))
-            prev_time = datetime.fromisoformat(prev.get("timestamp", "2000-01-01"))
-            hours_since = (now - prev_time).total_seconds() / 3600
+            parsed = json.loads(result.stdout)
+            output_summary = parsed.get("result", result.stdout[:500])
+        except (json.JSONDecodeError, TypeError):
+            output_summary = result.stdout[:500] if result.stdout else result.stderr[:500]
 
-            # Skip if same set of dead agents and less than 24h since last alert
-            if prev_agents == dead_set and hours_since < 24:
-                return
-        except (json.JSONDecodeError, ValueError, KeyError):
-            pass  # Corrupted file, re-alert
+        log(f"on_failure callback completed (exit {result.returncode})", task_name)
 
-    # Send alert
-    from lib.alerts import send_critical_monitoring_alert
-    disabled_info = [{"task_id": a, "label": f"com.pinglet.{a}", "exit_code": 78, "status": "disabled"} for a in dead_agents]
-    send_critical_monitoring_alert(disabled_info)
+        # Update learning state
+        from lib.heartbeat import _update_task_learning
+        if result.returncode == 0:
+            _update_task_learning(task_name, "fixed")
+        else:
+            _update_task_learning(task_name, "failed", {"error_pattern": (error or "")[:200]})
 
-    # Write debounce file
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    with open(alert_file, "w") as f:
-        json.dump({"agents": dead_set, "timestamp": now.isoformat()}, f)
+        return {
+            "invoked": True,
+            "exit_code": result.returncode,
+            "output": str(output_summary),
+            "log_file": str(log_file_path),
+        }
+
+    except subprocess.TimeoutExpired:
+        log(f"on_failure callback timed out after {callback_timeout}s", task_name)
+        with open(log_file_path, "w") as f:
+            f.write(f"TIMEOUT after {callback_timeout}s\n")
+        return {"invoked": True, "exit_code": -1, "output": "Timed out", "log_file": str(log_file_path)}
+
+    except FileNotFoundError:
+        log(f"on_failure command not found: {callback_cmd}", task_name)
+        return {"invoked": False, "exit_code": None, "output": f"Command not found: {callback_cmd}", "log_file": None}
+
+    except Exception as e:
+        log(f"on_failure callback error: {e}", task_name)
+        return {"invoked": False, "exit_code": None, "output": str(e), "log_file": None}
 
 
 def main():
@@ -937,12 +1072,25 @@ def main():
     parser.add_argument("--failures-before-alert", type=int, help="Failures before alert")
     parser.add_argument("--schedule-spec", help="Schedule spec (inline with add/edit)")
 
+    # on_failure callback flags (for --task-add and --task-edit)
+    parser.add_argument("--on-failure-command", help="Command to run on failure (e.g. 'claude')")
+    parser.add_argument("--on-failure-prompt", help="Prompt for on_failure command (supports {template_vars})")
+    parser.add_argument("--on-failure-timeout", type=int, help="Timeout for on_failure callback (default: 180)")
+    parser.add_argument("--on-failure-max-turns", type=int, help="Max turns for on_failure (default: 5)")
+
+    # Status command
+    parser.add_argument("--status", action="store_true", help="System status JSON (agent-parseable)")
+
     args = parser.parse_args()
 
     # Help / no args
     if args.help or len(sys.argv) == 1:
         print(HELP_TEXT)
         sys.exit(0)
+
+    # Status command (run before self-check to avoid noise)
+    if args.status:
+        sys.exit(run_status())
 
     # Lightweight self-check: warn if monitoring agents are dead
     # This runs on every CLI invocation so any surviving agent detects dead watchdogs

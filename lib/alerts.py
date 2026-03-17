@@ -33,7 +33,7 @@ def send_slack_message(message: str, channel_id: str = None) -> bool:
 
     Args:
         message: Message text to send (supports mrkdwn)
-        channel_id: Channel to post to (default: Damien's DM)
+        channel_id: Channel to post to (default from env)
 
     Returns:
         True if sent successfully, False otherwise
@@ -122,7 +122,8 @@ def send_macos_notification(title: str, message: str, sound: str = "default", op
         return False
 
 
-def send_critical(task_name: str, error: str, details: dict = None, log_file: str = None, task_id: str = None) -> None:
+def send_critical(task_name: str, error: str, details: dict = None, log_file: str = None,
+                   task_id: str = None, llm_result: dict = None) -> None:
     """
     Send critical failure alert - Slack + macOS notification.
     Called for any non-zero exit code.
@@ -133,6 +134,8 @@ def send_critical(task_name: str, error: str, details: dict = None, log_file: st
         details: Optional dict of additional details
         log_file: Path to log file for reference
         task_id: Task identifier for manual retry command
+        llm_result: Optional dict from on_failure callback with keys:
+                    invoked, exit_code, output, log_file
     """
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -153,12 +156,25 @@ def send_critical(task_name: str, error: str, details: dict = None, log_file: st
         for key, value in details.items():
             slack_message += f"\n• {key}: {value}"
 
+    # LLM troubleshooter status
+    slack_message += "\n"
+    if llm_result and llm_result.get("invoked"):
+        llm_exit = llm_result.get("exit_code", -1)
+        if llm_exit == 0:
+            slack_message += "*LLM Troubleshooter:* Invoked \u2713 (exit 0 \u2014 may be fixed, verify next run)\n"
+        else:
+            slack_message += f"*LLM Troubleshooter:* Invoked \u2717 (exit {llm_exit} \u2014 human intervention required)\n"
+            if llm_result.get("log_file"):
+                slack_message += f"  Output: `{llm_result['log_file']}`\n"
+    else:
+        slack_message += "*LLM Troubleshooter:* Not configured \u2014 human intervention required\n"
+
     # Add actionable commands
     slack_message += f"""
 *Actions:*
-• Retry now: `cd ~/Documents/Dev/pinglet && ./venv/bin/python pinglet.py --task {task_id or 'TASK_NAME'}`
-• View logs: `tail -100 {log_file or '~/Documents/Dev/pinglet/logs/pinglet.log'}`
-• Check all tasks: `./venv/bin/python pinglet.py --list`
+\u2022 Retry now: `cd {PROJECT_ROOT} && ./venv/bin/python pinglet.py --task {task_id or 'TASK_NAME'}`
+\u2022 View logs: `tail -100 {log_file or f'{PROJECT_ROOT}/logs/pinglet.log'}`
+\u2022 Check all tasks: `./venv/bin/python pinglet.py --status`
 """
 
     # Send to Slack
@@ -281,7 +297,7 @@ def send_health_summary(tasks: list, healthy: bool = True) -> None:
     if not healthy:
         slack_message += f"""
 *Actions:*
-• Check status: `cd ~/Documents/Dev/pinglet && ./venv/bin/python pinglet.py --list`
+• Check status: `cd {PROJECT_ROOT} && ./venv/bin/python pinglet.py --list`
 • Run manually: `./venv/bin/python pinglet.py --task <task_name>`
 • View logs: `tail -50 {log_file}`
 """
@@ -537,14 +553,15 @@ def send_manual_complete_notification(
         return False
 
 
-def send_critical_monitoring_alert(disabled_agents: list) -> bool:
+def send_critical_monitoring_alert(disabled_agents: list, llm_result: dict = None) -> bool:
     """Send urgent Slack alert when monitoring agents themselves are dead.
 
     This is a distinct, high-priority alert separate from regular task failures.
-    Includes fix commands for each disabled agent.
+    Includes fix commands, auto-recovery status, and LLM diagnosis results.
 
     Args:
         disabled_agents: List of dicts with keys: task_id, label, exit_code, status
+        llm_result: Optional dict with keys: attempted, success, log_file
 
     Returns:
         True if alert sent successfully
@@ -556,23 +573,37 @@ def send_critical_monitoring_alert(disabled_agents: list) -> bool:
     agent_lines = []
     fix_lines = []
     for agent in disabled_agents:
-        agent_lines.append(f"• `{agent['task_id']}` — {agent['status']} (exit {agent['exit_code']})")
+        agent_lines.append(f"\u2022 `{agent['task_id']}` \u2014 {agent['status']} (exit {agent['exit_code']})")
         fix_lines.append(f"  ./venv/bin/python pinglet.py --task-enable {agent['task_id']}")
 
     slack_message = f"""*Pinglet: MONITORING DOWN*
 
 *Timestamp:* {timestamp}
-*Status:* CRITICAL — monitoring agents are dead
+*Status:* CRITICAL \u2014 monitoring agents are dead
 
 *Disabled agents:*
 {chr(10).join(agent_lines)}
+"""
 
-*Fix (run from ~/Documents/Dev/pinglet):*
+    # LLM diagnosis status
+    if llm_result and llm_result.get("attempted"):
+        if llm_result.get("success"):
+            slack_message += "*LLM Self-Diagnosis:* Invoked \u2713 (exit 0 \u2014 may be fixed, verify next cycle)\n"
+        else:
+            slack_message += "*LLM Self-Diagnosis:* Invoked \u2717 (failed \u2014 human intervention required)\n"
+            if llm_result.get("log_file"):
+                slack_message += f"  Output: `{llm_result['log_file']}`\n"
+    else:
+        slack_message += "*LLM Self-Diagnosis:* Auto-recovery + LLM both failed\n"
+
+    slack_message += f"""
+*Fix (run from {PROJECT_ROOT}):*
 ```
 {chr(10).join(fix_lines)}
 ```
 
-_This means task failures may go undetected until agents are re-enabled._"""
+_This means task failures may go undetected until agents are re-enabled._
+_System status: `./venv/bin/python pinglet.py --status`_"""
 
     result = send_slack_message(slack_message)
 
