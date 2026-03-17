@@ -27,6 +27,10 @@ tasks/
 launchagents/*.plist
 !launchagents/com.pinglet.example.plist
 
+# Planning docs (contain local paths)
+PLAN.md
+Spec.md
+
 # Claude Code local settings
 .claude/
 
