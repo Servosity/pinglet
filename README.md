@@ -4,8 +4,6 @@
 
 # Pinglet
 
-> **This repository has moved to [github.com/servosity/pinglet](https://github.com/servosity/pinglet)**
-
 A universal task wrapper for macOS that guarantees no silent failures. Wraps scheduled tasks with unified logging, state tracking, and alerts (Slack + macOS).
 
 ## What's a Pinglet?
@@ -16,82 +14,30 @@ Think of it like pods in Kubernetes or containers in Docker — "pinglet" is the
 
 ---
 
-## Agent Instructions
+## Usage
 
-Run `--help` for the full CLI reference in one call:
+Run from repo root. All commands output JSON — parse the `ok` field.
 
 ```bash
+# Setup (after cloning)
+bash scripts/install-hooks.sh
+
+# Full CLI reference
 ./venv/bin/python ./pinglet.py --help
-```
 
-All management commands output JSON to stdout. Parse `ok` field for success/failure.
+# List all pinglets
+./venv/bin/python ./pinglet.py --list --json
 
-### Quick Reference
+# Full details + state + logs for one pinglet
+./venv/bin/python ./pinglet.py --task-show <id>
 
-```bash
-P="./venv/bin/python ./pinglet.py"
+# Add + enable a pinglet
+./venv/bin/python ./pinglet.py --task-add my-task --command /usr/bin/python3 --args script.py --schedule-spec "daily 7:00"
+./venv/bin/python ./pinglet.py --task-enable my-task
 
-# List all tasks (JSON)
-$P --list --json
-
-# Full task details + state + recent logs (one call)
-$P --task-show <id>
-
-# Add a task
-$P --task-add <id> --command /path/to/exe --args arg1 arg2 --name "Display Name" --schedule-spec "daily 7:00" --timeout 300
-
-# Set/change schedule
-$P --schedule <id> "every 1h"
-
-# Enable scheduling (generates plist + loads LaunchAgent)
-$P --task-enable <id>
-
-# Edit a task (only specified fields update)
-$P --task-edit <id> --timeout 600
-
-# Disable scheduling (unloads LaunchAgent)
-$P --task-disable <id>
-
-# Remove task entirely (auto-disables if scheduled)
-$P --task-remove <id>
-
-# View task logs
-$P --task-logs <id> 100
-
-# Preview any change without modifying
-$P --task-add test --command /usr/bin/echo --dry-run
-```
-
-### Schedule Syntax
-
-| Format | Example | Result |
-|--------|---------|--------|
-| Interval | `every 1h`, `every 30m`, `every 3600s` | StartInterval |
-| Daily | `daily 7:00` | 7:00 AM daily |
-| Multi-daily | `daily 7:00,19:00` | 7 AM and 7 PM |
-| Weekly | `weekly mon 7:33` | Monday at 7:33 AM |
-
-### Output Format
-
-```json
-{"ok": true, "task_id": "...", "config": {...}}
-{"ok": false, "error": "Task not found"}
-```
-
-Exit codes: `0` = success, `1` = error, `2` = validation error.
-
-### Workflow: Add + Schedule + Enable
-
-```bash
-$P --task-add my-task --command /usr/bin/python3 --args script.py --schedule-spec "daily 7:00"
-$P --task-enable my-task
-```
-
-### Workflow: Debug a Failing Task
-
-```bash
-$P --task-show my-task    # config + state + recent logs in one call
-$P --task-logs my-task 200  # more log lines if needed
+# Run health check / heartbeat
+./venv/bin/python ./pinglet.py --healthcheck
+./venv/bin/python ./pinglet.py --heartbeat
 ```
 
 ---
@@ -107,31 +53,6 @@ $P --task-logs my-task 200  # more log lines if needed
 - **Monitoring Self-Protection**: Every CLI invocation checks if watchdog agents are alive; surviving agents detect and alert when monitoring is down ("who watches the watchmen")
 - **LaunchAgent Health Detection**: Real-time `launchctl` status checks detect disabled (exit 78), failed, and not-loaded agents — not just plist existence
 - **Escalation Tiers**: Staleness alerts escalate from warning (2x threshold) to urgent (5x) to critical (10x)
-
-## Quick Start
-
-```bash
-# After cloning — install pre-commit hook
-bash scripts/install-hooks.sh
-
-# Run a pinglet
-./venv/bin/python pinglet.py --task uce
-
-# List all pinglets (includes LaunchAgent status + warnings)
-./venv/bin/python pinglet.py --list
-
-# List all pinglets (JSON)
-./venv/bin/python pinglet.py --list --json
-
-# Show full pinglet details + logs
-./venv/bin/python pinglet.py --task-show uce
-
-# Run health check
-./venv/bin/python pinglet.py --healthcheck
-
-# Test alerts
-./venv/bin/python pinglet.py --test-alerts
-```
 
 ## Adding a New Pinglet
 
@@ -438,36 +359,6 @@ tasks:
 
 With stdout `{"tabs_archived": 12, "tabs_kept": 8}`, the notification shows: `Archived 12 tabs, kept 8`
 
-## CLI Reference
-
-### Task Management
-
-| Command | Description |
-|---------|-------------|
-| `--task-add <id>` | Add a new task |
-| `--task-edit <id>` | Edit an existing task |
-| `--task-remove <id>` | Remove a task (auto-disables) |
-| `--task-show <id>` | Full details + state + logs (JSON) |
-| `--task-logs <id> [N]` | Last N lines of task logs |
-| `--task-enable <id>` | Generate plist + load LaunchAgent |
-| `--task-disable <id>` | Unload + remove plist |
-| `--schedule <id> <spec>` | Set task schedule |
-| `--list [--json]` | List all tasks (includes LaunchAgent status) |
-| `--dry-run` | Preview changes |
-
-### Task Execution
-
-| Command | Description |
-|---------|-------------|
-| `--task <name>`, `-t` | Run a registered task |
-| `--run-now <task>` | Run a missed task immediately |
-| `--ignore <task>` | Mark a missed task as ignored |
-| `--healthcheck`, `-H` | Run daily health summary (checks launchd status) |
-| `--heartbeat` | Run heartbeat check (detects disabled agents) |
-| `--test-alerts` | Test notification system |
-| `--install-heartbeat` | Install heartbeat LaunchAgent |
-| `--uninstall-heartbeat` | Uninstall heartbeat LaunchAgent |
-
 ## Configuration Reference
 
 ### Notifications
@@ -541,7 +432,7 @@ pinglet/
 │   ├── ignored.py          # Ignored pinglets management
 │   ├── queue.py            # Pinglet queue for sequential execution
 │   └── output_formatter.py # Output formatting (JSON/text)
-├── tests/                  # Test suite (220 tests)
+├── tests/                  # Test suite (227 tests)
 ├── state/                  # Per-task state files (*.json)
 │   ├── _learning.json      # Adaptive loop pattern history
 │   └── _monitoring_down_state.json  # Monitoring agent down-state tracking
