@@ -526,8 +526,9 @@ class TestMonitoringDownThreshold:
         assert state["healthcheck"]["consecutive_detections"] == 1
         assert _should_alert_monitoring_down("healthcheck", state) is False
 
-    def test_below_threshold_no_alert(self):
-        """Two detections should still NOT trigger a human alert."""
+    @patch("lib.heartbeat._load_learning_state", return_value={"version": 1, "agents": {}, "tasks": {}})
+    def test_below_threshold_no_alert(self, mock_learning):
+        """Two detections should still NOT trigger a human alert (default threshold=3)."""
         from lib.heartbeat import (
             _record_monitoring_detection,
             _should_alert_monitoring_down,

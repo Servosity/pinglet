@@ -323,17 +323,22 @@ def _clear_monitoring_down(agent_id: str, state: dict) -> dict:
     return state
 
 
-def _attempt_auto_recovery(agent_id: str) -> bool:
+def _attempt_auto_recovery(agent_id: str) -> str:
     """Attempt auto-recovery of a disabled monitoring agent.
 
-    Uses bootout+bootstrap sequence. Returns True if agent is healthy after.
+    Uses bootout+bootstrap sequence.
+
+    Returns:
+        "recovered" - bootstrap succeeded AND agent wasn't in a reload cycle
+        "reloaded" - bootstrap succeeded but agent keeps cycling (not a real fix)
+        "failed" - bootstrap failed or agent still disabled
     """
     label = f"com.pinglet.{agent_id}"
     user_plist = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
 
     if not user_plist.exists():
         log(f"Cannot recover {agent_id}: plist not found", "heartbeat")
-        return False
+        return "failed"
 
     try:
         uid = subprocess.check_output(["id", "-u"]).decode().strip()
@@ -352,19 +357,32 @@ def _attempt_auto_recovery(agent_id: str) -> bool:
 
         if result.returncode != 0:
             log(f"Auto-recovery failed for {agent_id}: {result.stderr.strip()}", "heartbeat")
-            return False
+            return "failed"
 
         # Verify recovery
         status = _get_launchd_status(agent_id)
         if status["disabled"]:
             log(f"Auto-recovery failed for {agent_id}: still disabled after bootstrap", "heartbeat")
-            return False
+            return "failed"
+
+        # Check learning history — if we keep "recovering" this agent but it
+        # keeps appearing disabled, bootstrap is just resetting LastExitStatus
+        # without fixing the underlying problem (e.g. the task script itself
+        # exits 78 or the task keeps failing).
+        learning = _load_learning_state()
+        agent_learning = learning.get("agents", {}).get(agent_id, {})
+        consecutive = agent_learning.get("consecutive_auto_recoveries", 0)
+
+        if consecutive >= 3:
+            log(f"Auto-recovery for {agent_id} is a reload cycle "
+                f"({consecutive} consecutive reloads, not real recoveries)", "heartbeat")
+            return "reloaded"
 
         log(f"Auto-recovery succeeded for {agent_id}", "heartbeat")
-        return True
+        return "recovered"
     except Exception as e:
         log(f"Auto-recovery error for {agent_id}: {e}", "heartbeat")
-        return False
+        return "failed"
 
 
 def _attempt_llm_self_diagnosis(agent_id: str, status: dict) -> bool:
@@ -488,9 +506,16 @@ def _update_learning_state(agent_id: str, outcome: str, details: dict = None) ->
     if outcome == "auto_recovery":
         entry["total_auto_recoveries"] += 1
         entry["consecutive_auto_recoveries"] += 1
+    elif outcome == "reload_cycle":
+        # Bootstrap succeeded but agent keeps cycling — NOT a real recovery.
+        # Don't increment auto_recoveries or consecutive count.
+        entry.setdefault("total_reload_cycles", 0)
+        entry["total_reload_cycles"] += 1
+        entry["consecutive_auto_recoveries"] = 0  # Break the false streak
     elif outcome == "llm_recovery":
         entry["total_llm_recoveries"] += 1
         entry["consecutive_auto_recoveries"] = 0  # Reset consecutive auto
+        entry["total_reload_cycles"] = 0  # LLM actually fixed it
         # Extract known issue from details
         if details and details.get("summary"):
             issue = details["summary"][:200]
@@ -514,8 +539,16 @@ def _detect_and_adapt(entry: dict) -> None:
     auto = entry["total_auto_recoveries"]
     consecutive = entry["consecutive_auto_recoveries"]
     human = entry["total_human_alerts"]
+    reload_cycles = entry.get("total_reload_cycles", 0)
 
-    if total >= 10 and auto == total and consecutive >= 10:
+    if reload_cycles >= 3:
+        # Reload cycle: bootstrap keeps "fixing" it but it keeps coming back.
+        # The underlying task/script is broken, not the launchd config.
+        entry["pattern"] = "reload_cycle"
+        entry["effective_threshold"] = max(2, MONITORING_ALERT_THRESHOLD - 1)
+        entry["suppressed"] = False
+        entry["suppressed_reason"] = None
+    elif total >= 10 and auto == total and consecutive >= 10:
         # Chronic cycle: always detected, always auto-recovers
         entry["pattern"] = "chronic_cycle"
         entry["effective_threshold"] = max(10, entry.get("effective_threshold", MONITORING_ALERT_THRESHOLD))
@@ -739,13 +772,18 @@ def run_heartbeat(config: dict, wake_delay: Optional[int] = None) -> dict:
             entry = monitoring_down_state[agent_id]
 
             # Tier 1: Always attempt auto-recovery
-            recovered = _attempt_auto_recovery(agent_id)
+            recovery_result = _attempt_auto_recovery(agent_id)
 
-            if recovered:
+            if recovery_result == "recovered":
                 log(f"Auto-recovery succeeded for {agent_id}", "heartbeat")
                 monitoring_down_state = _clear_monitoring_down(agent_id, monitoring_down_state)
                 _update_learning_state(agent_id, "auto_recovery")
                 continue
+            elif recovery_result == "reloaded":
+                # Bootstrap worked but this agent keeps cycling — don't count
+                # as real recovery, escalate to next tier
+                log(f"Agent {agent_id} is in a reload cycle, escalating", "heartbeat")
+                _update_learning_state(agent_id, "reload_cycle")
 
             # Tier 2: LLM self-diagnosis (after auto-recovery fails, attempt once)
             if not entry.get("llm_diagnosis_attempted", False):

@@ -925,19 +925,29 @@ def get_system_status() -> dict:
     # Learning summary
     learning_summary = {}
     for agent_id, agent_data in learning.get("agents", {}).items():
-        learning_summary[agent_id] = {
+        summary = {
             "pattern": agent_data.get("pattern", "unknown"),
             "suppressed": agent_data.get("suppressed", False),
             "effective_threshold": agent_data.get("effective_threshold", MONITORING_ALERT_THRESHOLD),
         }
+        if agent_data.get("total_reload_cycles", 0) > 0:
+            summary["total_reload_cycles"] = agent_data["total_reload_cycles"]
+        learning_summary[agent_id] = summary
 
-    # Add chronic cycle agents to issues
+    # Add learning-detected patterns to issues
     for agent_id, data in learning.get("agents", {}).items():
         if data.get("pattern") == "chronic_cycle":
             issue_list.append({
                 "task_id": agent_id,
                 "severity": "info",
-                "message": f"Chronic cycle (auto-recovers, suppressed)",
+                "message": "Chronic cycle (auto-recovers, suppressed)",
+            })
+        elif data.get("pattern") == "reload_cycle":
+            reload_count = data.get("total_reload_cycles", 0)
+            issue_list.append({
+                "task_id": agent_id,
+                "severity": "warning",
+                "message": f"Reload cycle ({reload_count}x bootstrap without real fix — underlying task/script is broken)",
             })
 
     total_tasks = len(tasks_config)
