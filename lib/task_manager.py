@@ -721,6 +721,38 @@ def get_launchd_status(task_id: str) -> Dict[str, Any]:
         }
 
 
+def get_launchd_run_count(task_id: str) -> Optional[int]:
+    """Get the number of times launchd has fired an agent since bootstrap.
+
+    Uses 'launchctl print' to parse the 'runs = N' field. This detects
+    stale calendar triggers where the agent is loaded but never fires.
+
+    Returns:
+        Run count (int), or None if agent is not loaded or parse fails.
+    """
+    label = f"com.pinglet.{task_id}"
+    uid = _get_uid()
+
+    try:
+        result = subprocess.run(
+            ["launchctl", "print", f"gui/{uid}/{label}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("runs = "):
+                try:
+                    return int(line.split("=")[1].strip())
+                except (ValueError, IndexError):
+                    pass
+        return None
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+
 def get_all_launchd_statuses() -> Dict[str, Dict[str, Any]]:
     """Get launchd status for all pinglet agents by parsing launchctl list once.
 

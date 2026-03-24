@@ -872,7 +872,10 @@ def _check_monitoring_agents() -> list:
     dead = []
     for agent_id in MONITORING_AGENTS:
         status = get_launchd_status(agent_id)
-        if status["disabled"] or status["status"] in ("failed", "not_loaded", "not_installed"):
+        # Note: "failed" (non-zero exit) is NOT included — monitoring agents
+        # exit 1 when they find issues (missed tasks, disabled agents), which
+        # is normal operation, not a dead agent.
+        if status["disabled"] or status["status"] in ("not_loaded", "not_installed"):
             dead.append(agent_id)
 
     if dead:

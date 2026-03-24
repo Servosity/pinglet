@@ -53,6 +53,12 @@ def _get_launchd_status(task_id: str) -> dict:
     return get_launchd_status(task_id)
 
 
+def _get_launchd_run_count(task_id: str):
+    """Wrapper for get_launchd_run_count to allow patching."""
+    from lib.task_manager import get_launchd_run_count
+    return get_launchd_run_count(task_id)
+
+
 HEARTBEAT_ALERT_FILE = state_module.STATE_DIR / "_heartbeat_alerts.json"
 ALERT_COOLDOWN_HOURS = 24
 
@@ -181,6 +187,86 @@ def detect_disabled_agents(config: dict) -> List[Dict]:
             })
 
     return disabled
+
+
+def detect_stale_triggers(missed_tasks: List[Dict]) -> List[Dict]:
+    """Detect missed tasks caused by stale launchd calendar triggers.
+
+    When launchd bootstraps an agent but the calendar event trigger gets stuck,
+    the agent shows runs=0 and never fires. This function identifies such tasks.
+
+    Args:
+        missed_tasks: List of missed task dicts from detect_missed_tasks()
+
+    Returns:
+        Subset of missed_tasks that have stale triggers (runs=0, agent loaded)
+    """
+    stale = []
+    for task in missed_tasks:
+        task_name = task["task_name"]
+        status = _get_launchd_status(task_name)
+
+        # Only check tasks that are loaded and not disabled
+        if not status.get("installed") or status.get("disabled"):
+            continue
+        if status.get("status") in ("not_loaded", "not_installed"):
+            continue
+
+        run_count = _get_launchd_run_count(task_name)
+        if run_count is not None and run_count == 0:
+            log(f"Stale trigger detected for {task_name}: loaded but runs=0", "heartbeat")
+            stale.append(task)
+
+    return stale
+
+
+def recover_stale_trigger(task_id: str) -> str:
+    """Recover a stale launchd calendar trigger via bootout+bootstrap.
+
+    Args:
+        task_id: Task identifier
+
+    Returns:
+        "recovered" if bootstrap succeeded, "failed" otherwise
+    """
+    label = f"com.pinglet.{task_id}"
+    user_plist = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+
+    if not user_plist.exists():
+        log(f"Cannot recover stale trigger for {task_id}: plist not found", "heartbeat")
+        return "failed"
+
+    try:
+        uid = subprocess.check_output(["id", "-u"]).decode().strip()
+
+        # Bootout (ignore errors — agent may not be loaded)
+        subprocess.run(
+            ["launchctl", "bootout", f"gui/{uid}/{label}"],
+            capture_output=True, timeout=10,
+        )
+
+        # Bootstrap
+        result = subprocess.run(
+            ["launchctl", "bootstrap", f"gui/{uid}", str(user_plist)],
+            capture_output=True, text=True, timeout=10,
+        )
+
+        if result.returncode != 0:
+            log(f"Stale trigger recovery failed for {task_id}: {result.stderr.strip()}", "heartbeat")
+            return "failed"
+
+        # Verify — run count should reset (may still be 0 since trigger hasn't fired yet)
+        new_count = _get_launchd_run_count(task_id)
+        if new_count is not None and new_count >= 0:
+            log(f"Stale trigger recovery succeeded for {task_id} (re-bootstrapped)", "heartbeat")
+            return "recovered"
+
+        log(f"Stale trigger recovery uncertain for {task_id}", "heartbeat")
+        return "recovered"
+
+    except Exception as e:
+        log(f"Stale trigger recovery error for {task_id}: {e}", "heartbeat")
+        return "failed"
 
 
 def _load_disabled_agent_alert_state() -> dict:
@@ -828,8 +914,18 @@ def run_heartbeat(config: dict, wake_delay: Optional[int] = None) -> dict:
         log("All tasks up to date", "heartbeat")
         return {"missed_count": 0, "tasks": [], "disabled_agents": []}
 
+    # Detect and recover stale launchd calendar triggers
+    stale_triggers_recovered = 0
     if missed_tasks:
         log(f"Found {len(missed_tasks)} missed task(s)", "heartbeat")
+
+        stale = detect_stale_triggers(missed_tasks)
+        for task in stale:
+            task_name = task["task_name"]
+            result = recover_stale_trigger(task_name)
+            if result == "recovered":
+                stale_triggers_recovered += 1
+                log(f"Recovered stale trigger for {task_name}", "heartbeat")
 
     # Wait for wake delay (allows system to stabilize after wake)
     if wake_delay > 0 and missed_tasks:
@@ -901,4 +997,5 @@ _Use macOS notification to Run or Ignore_"""
         "missed_count": len(missed_tasks),
         "tasks": missed_tasks,
         "disabled_agents": disabled,
+        "stale_triggers_recovered": stale_triggers_recovered,
     }

@@ -872,3 +872,281 @@ class TestMonitoringDownThreshold:
             assert loaded_state[agent_id]["last_alert"] == original_state[agent_id]["last_alert"]
             assert loaded_state[agent_id]["recovery_attempts"] == original_state[agent_id]["recovery_attempts"]
             assert loaded_state[agent_id]["llm_diagnosis_attempted"] == original_state[agent_id]["llm_diagnosis_attempted"]
+
+
+class TestMonitoringAgentFalsePositive:
+    """Bug fix: monitoring agents exiting 1 (found issues) should NOT be flagged as DOWN.
+
+    The heartbeat exits 1 when it finds missed tasks — this is normal operation.
+    _check_monitoring_agents was treating status='failed' as dead, causing
+    false 'WARNING: Monitoring agent(s) DOWN: heartbeat' on every CLI invocation.
+    """
+
+    def test_monitoring_agent_exit_1_not_dead(self):
+        """Heartbeat exiting 1 (found missed tasks) should NOT be flagged as dead."""
+        from pinglet import _check_monitoring_agents
+
+        def mock_status(task_id):
+            if task_id == "heartbeat":
+                # Exit 1 = found missed tasks, normal operation
+                return {"installed": True, "running": False, "exit_code": 1,
+                        "disabled": False, "status": "failed"}
+            return {"installed": True, "running": False, "exit_code": 0,
+                    "disabled": False, "status": "idle"}
+
+        with patch("lib.task_manager.get_launchd_status", side_effect=mock_status):
+            dead = _check_monitoring_agents()
+
+        assert "heartbeat" not in dead
+
+    def test_monitoring_agent_exit_0_not_dead(self):
+        """Heartbeat exiting 0 (no issues found) should NOT be flagged as dead."""
+        from pinglet import _check_monitoring_agents
+
+        def mock_status(task_id):
+            return {"installed": True, "running": False, "exit_code": 0,
+                    "disabled": False, "status": "idle"}
+
+        with patch("lib.task_manager.get_launchd_status", side_effect=mock_status):
+            dead = _check_monitoring_agents()
+
+        assert len(dead) == 0
+
+    def test_monitoring_agent_disabled_is_dead(self):
+        """Monitoring agent with exit 78 (disabled by launchd) SHOULD be flagged as dead."""
+        from pinglet import _check_monitoring_agents
+
+        def mock_status(task_id):
+            if task_id == "heartbeat":
+                return {"installed": True, "running": False, "exit_code": 78,
+                        "disabled": True, "status": "disabled"}
+            return {"installed": True, "running": False, "exit_code": 0,
+                    "disabled": False, "status": "idle"}
+
+        with patch("lib.task_manager.get_launchd_status", side_effect=mock_status):
+            dead = _check_monitoring_agents()
+
+        assert "heartbeat" in dead
+
+    def test_monitoring_agent_not_loaded_is_dead(self):
+        """Monitoring agent not loaded in launchd SHOULD be flagged as dead."""
+        from pinglet import _check_monitoring_agents
+
+        def mock_status(task_id):
+            if task_id == "healthcheck":
+                return {"installed": True, "running": False, "exit_code": None,
+                        "disabled": False, "status": "not_loaded"}
+            return {"installed": True, "running": False, "exit_code": 0,
+                    "disabled": False, "status": "idle"}
+
+        with patch("lib.task_manager.get_launchd_status", side_effect=mock_status):
+            dead = _check_monitoring_agents()
+
+        assert "healthcheck" in dead
+
+    def test_monitoring_agent_not_installed_is_dead(self):
+        """Monitoring agent with missing plist SHOULD be flagged as dead."""
+        from pinglet import _check_monitoring_agents
+
+        def mock_status(task_id):
+            if task_id == "heartbeat":
+                return {"installed": False, "running": False, "exit_code": None,
+                        "disabled": False, "status": "not_installed"}
+            return {"installed": True, "running": False, "exit_code": 0,
+                    "disabled": False, "status": "idle"}
+
+        with patch("lib.task_manager.get_launchd_status", side_effect=mock_status):
+            dead = _check_monitoring_agents()
+
+        assert "heartbeat" in dead
+
+    def test_monitoring_agent_running_not_dead(self):
+        """Monitoring agent that is currently running should NOT be flagged as dead."""
+        from pinglet import _check_monitoring_agents
+
+        def mock_status(task_id):
+            if task_id == "heartbeat":
+                return {"installed": True, "running": True, "exit_code": None,
+                        "disabled": False, "status": "running"}
+            return {"installed": True, "running": False, "exit_code": 0,
+                    "disabled": False, "status": "idle"}
+
+        with patch("lib.task_manager.get_launchd_status", side_effect=mock_status):
+            dead = _check_monitoring_agents()
+
+        assert "heartbeat" not in dead
+
+
+class TestStaleLaunchdTriggerDetection:
+    """Bug fix: detect and recover stale launchd calendar triggers.
+
+    When launchd bootstraps an agent but the calendar event trigger gets stuck,
+    the agent shows runs=0 and never fires. The heartbeat detects the missed task
+    but never attempts to fix the root cause (stale trigger).
+
+    The fix adds stale trigger detection: when a task is overdue AND launchd
+    shows runs=0 (never fired since bootstrap), attempt bootout+bootstrap recovery.
+    """
+
+    def test_get_launchd_run_count_parses_runs(self):
+        """get_launchd_run_count should parse 'runs = N' from launchctl print."""
+        from lib.task_manager import get_launchd_run_count
+
+        mock_output = "\truns = 0\n\tlast exit code = (never exited)\n"
+        mock_result = MagicMock(returncode=0, stdout=mock_output, stderr="")
+
+        with patch("lib.task_manager._get_uid", return_value="501"), \
+             patch("subprocess.run", return_value=mock_result):
+            count = get_launchd_run_count("obsidian-tab-archiver")
+
+        assert count == 0
+
+    def test_get_launchd_run_count_nonzero(self):
+        """get_launchd_run_count should return actual run count."""
+        from lib.task_manager import get_launchd_run_count
+
+        mock_output = "\truns = 267\n\tlast exit code = 0\n"
+        mock_result = MagicMock(returncode=0, stdout=mock_output, stderr="")
+
+        with patch("lib.task_manager._get_uid", return_value="501"), \
+             patch("subprocess.run", return_value=mock_result):
+            count = get_launchd_run_count("heartbeat")
+
+        assert count == 267
+
+    def test_get_launchd_run_count_not_loaded(self):
+        """get_launchd_run_count should return None for unloaded agents."""
+        from lib.task_manager import get_launchd_run_count
+
+        mock_result = MagicMock(returncode=1, stdout="", stderr="not found")
+
+        with patch("lib.task_manager._get_uid", return_value="501"), \
+             patch("subprocess.run", return_value=mock_result):
+            count = get_launchd_run_count("nonexistent")
+
+        assert count is None
+
+    def test_detect_stale_triggers_finds_zero_runs(self, sample_config):
+        """detect_stale_triggers should identify tasks with runs=0 that are overdue."""
+        from lib.heartbeat import detect_stale_triggers
+
+        old_time = datetime.now() - timedelta(hours=30)
+        mock_state = MockTaskState(
+            task_name="obsidian-tab-archiver",
+            last_run=old_time.isoformat(),
+            last_status="success",
+        )
+
+        missed_tasks = [{
+            "task_name": "obsidian-tab-archiver",
+            "display_name": "Obsidian Tab Archiver",
+            "hours_overdue": 16.0,
+            "threshold": 14,
+            "last_run": old_time.isoformat(),
+            "never_run": False,
+        }]
+
+        with patch("lib.heartbeat._get_launchd_run_count", return_value=0), \
+             patch("lib.heartbeat._get_launchd_status", return_value={
+                 "installed": True, "running": False, "exit_code": 0,
+                 "disabled": False, "status": "idle"}):
+            stale = detect_stale_triggers(missed_tasks)
+
+        assert len(stale) == 1
+        assert stale[0]["task_name"] == "obsidian-tab-archiver"
+
+    def test_detect_stale_triggers_ignores_healthy(self, sample_config):
+        """Tasks with runs > 0 should NOT be flagged as stale triggers."""
+        from lib.heartbeat import detect_stale_triggers
+
+        old_time = datetime.now() - timedelta(hours=30)
+        missed_tasks = [{
+            "task_name": "obsidian-tab-archiver",
+            "display_name": "Obsidian Tab Archiver",
+            "hours_overdue": 16.0,
+            "threshold": 14,
+            "last_run": old_time.isoformat(),
+            "never_run": False,
+        }]
+
+        with patch("lib.heartbeat._get_launchd_run_count", return_value=42), \
+             patch("lib.heartbeat._get_launchd_status", return_value={
+                 "installed": True, "running": False, "exit_code": 0,
+                 "disabled": False, "status": "idle"}):
+            stale = detect_stale_triggers(missed_tasks)
+
+        assert len(stale) == 0
+
+    def test_recover_stale_trigger_bootout_bootstrap(self):
+        """recover_stale_trigger should bootout+bootstrap to reset the trigger."""
+        from lib.heartbeat import recover_stale_trigger
+
+        mock_uid_result = MagicMock(returncode=0, stdout=b"501\n")
+        mock_bootout_result = MagicMock(returncode=0)
+        mock_bootstrap_result = MagicMock(returncode=0)
+
+        call_count = {"n": 0}
+
+        def mock_run(cmd, **kwargs):
+            call_count["n"] += 1
+            if cmd == ["id", "-u"]:
+                return MagicMock(stdout=b"501")
+            elif "bootout" in cmd:
+                return mock_bootout_result
+            elif "bootstrap" in cmd:
+                return mock_bootstrap_result
+            return MagicMock(returncode=0)
+
+        plist = Path.home() / "Library" / "LaunchAgents" / "com.pinglet.obsidian-tab-archiver.plist"
+
+        with patch("subprocess.run", side_effect=mock_run), \
+             patch("pathlib.Path.exists", return_value=True), \
+             patch("lib.heartbeat._get_launchd_run_count", return_value=1):
+            result = recover_stale_trigger("obsidian-tab-archiver")
+
+        assert result == "recovered"
+
+    def test_recover_stale_trigger_no_plist(self):
+        """recover_stale_trigger should fail gracefully when plist is missing."""
+        from lib.heartbeat import recover_stale_trigger
+
+        with patch("pathlib.Path.exists", return_value=False):
+            result = recover_stale_trigger("nonexistent-task")
+
+        assert result == "failed"
+
+    def test_heartbeat_recovers_stale_triggers(self, sample_config):
+        """run_heartbeat should attempt recovery for tasks with stale triggers."""
+        old_time = datetime.now() - timedelta(hours=30)
+        mock_state = MockTaskState(
+            task_name="obsidian-tab-archiver",
+            last_run=old_time.isoformat(),
+            last_status="success",
+        )
+
+        stale_tasks = [{
+            "task_name": "obsidian-tab-archiver",
+            "display_name": "Obsidian Tab Archiver",
+            "hours_overdue": 16.0,
+            "threshold": 14,
+            "last_run": old_time.isoformat(),
+            "never_run": False,
+        }]
+
+        with patch("lib.heartbeat._load_state", return_value=mock_state), \
+             patch("lib.heartbeat._is_ignored", return_value=False), \
+             patch("lib.heartbeat._send_missed_task_notification"), \
+             patch("lib.heartbeat._send_slack_message"), \
+             patch("lib.heartbeat._load_heartbeat_alert_state", return_value={}), \
+             patch("lib.heartbeat._save_heartbeat_alert_state"), \
+             patch("lib.heartbeat.detect_disabled_agents", return_value=[]), \
+             patch("lib.heartbeat._load_monitoring_down_state", return_value={}), \
+             patch("lib.heartbeat._save_monitoring_down_state"), \
+             patch("lib.heartbeat.detect_stale_triggers", return_value=stale_tasks), \
+             patch("lib.heartbeat.recover_stale_trigger", return_value="recovered") as mock_recover:
+            from lib.heartbeat import run_heartbeat
+
+            result = run_heartbeat(sample_config, wake_delay=0)
+
+            mock_recover.assert_called_once_with("obsidian-tab-archiver")
+            assert result.get("stale_triggers_recovered", 0) >= 1
