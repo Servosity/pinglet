@@ -156,3 +156,11 @@ def mock_subprocess():
 def mock_terminal_notifier(mock_subprocess):
     """Mock terminal-notifier for testing macOS notifications."""
     return mock_subprocess
+
+
+@pytest.fixture(autouse=True)
+def isolate_logs(tmp_path_factory):
+    """Redirect LOGS_DIR to temp dir so tests never write to real logs."""
+    test_logs = tmp_path_factory.mktemp("isolated_logs")
+    with patch("lib.logging.LOGS_DIR", test_logs):
+        yield test_logs
