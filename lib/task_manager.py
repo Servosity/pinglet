@@ -947,6 +947,7 @@ def get_system_status() -> dict:
             "consecutive_failures": state.consecutive_failures,
             "schedule": task_cfg.get("schedule"),
             "has_on_failure": "on_failure" in task_cfg,
+            "has_on_diagnose": "on_diagnose" in task_cfg,
         })
 
     # Load alert and learning state

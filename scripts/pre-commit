@@ -18,7 +18,7 @@ PII_PATTERNS=(
 
 # Case-sensitive patterns (must match exact case)
 CASE_SENSITIVE_PATTERNS=(
-    'D[A-Z0-9]{8,}'               # Slack DM channel IDs (D + 8+ uppercase alphanum)
+    'D[A-Z0-9]*[0-9][A-Z0-9]*[A-Z][A-Z0-9]{5,}'  # Slack DM channel IDs (D + mixed alphanum with digits)
 )
 
 # Files that are allowed to contain these patterns

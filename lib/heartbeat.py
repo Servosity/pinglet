@@ -15,6 +15,7 @@ from lib import state as state_module
 from lib import ignored as ignored_module
 from lib import alerts as alerts_module
 from lib.logging import log
+from lib.task_manager import MONITORING_AGENTS
 
 # Re-export for testing patches
 STATE_DIR = state_module.STATE_DIR
@@ -75,7 +76,55 @@ MONITORING_ALERT_COOLDOWN_HOURS = 24
 LEARNING_STATE_FILE = state_module.STATE_DIR / "_learning.json"
 LEARNING_FILE = LEARNING_STATE_FILE  # Alias for test patching
 
-# Self-diagnosis prompt
+# Task diagnosis state — tracks per-task LLM diagnosis attempts
+TASK_DIAGNOSIS_STATE_FILE = state_module.STATE_DIR / "_task_diagnosis.json"
+TASK_DIAGNOSIS_COOLDOWN_HOURS = 6  # Don't re-invoke LLM more than once per 6h per task
+TASK_DIAGNOSIS_MIN_DETECTIONS = 2  # Need 2+ heartbeat detections before invoking LLM
+
+# Task-level diagnosis prompt — for regular tasks (not monitoring agents)
+# Unlike SELF_DIAGNOSIS_PROMPT, this allows fixing the working directory and dependencies
+TASK_DIAGNOSE_PROMPT = """Pinglet task '{task_id}' anomaly: {detected_problem}.
+
+TASK CONFIG:
+- Name: {task_name}
+- Command: {command}
+- Working dir: {working_dir}
+- Schedule: {schedule}
+- Last run: {last_run}
+- Consecutive failures: {consecutive_failures}
+
+LAUNCHD STATUS: {launchd_status}
+Recovery attempts so far: {recovery_attempts}
+
+READ THESE FILES FIRST:
+- tail -50 {log_dir}/pinglet.log | grep {task_id}
+- tail -50 {log_dir}/{task_id}.log
+- tail -50 {log_dir}/{task_id}.err
+- cat {state_file}
+
+LEARNING CONTEXT: Read {learning_file} for previous diagnosis history.
+
+DIAGNOSIS STEPS:
+1. Read logs to understand what happened
+2. cd to working directory and investigate:
+   - Does the command exist and is it executable?
+   - Are dependencies intact (venv, git repos, config files)?
+   - Check for broken git state (submodules, nested repos, dirty index)
+   - Check for permission issues
+   - Check for missing environment variables
+3. Fix the root cause in the working directory
+4. If launchd disabled (exit 78): fix plist, then bootout+bootstrap
+5. If stale trigger: disable+enable the task via pinglet CLI
+6. Verify the fix by running: {python_path} {project_root}/pinglet.py --run-now {task_id}
+
+RULES:
+- Fix the ROOT CAUSE, not just symptoms
+- You MAY modify files in the working directory if that's where the bug is
+- Do NOT modify other tasks or their working directories
+- Do NOT delete data files unless they are clearly corrupt temp files
+- Exit 0 if fixed (task runs successfully). Exit 1 if human intervention needed."""
+
+# Self-diagnosis prompt (monitoring agents only — restricted to plist fixes)
 SELF_DIAGNOSIS_PROMPT = """Pinglet monitoring agent '{agent_id}' is DOWN. Fix it.
 
 STATUS: {status} | EXIT: {exit_code} | LABEL: com.pinglet.{agent_id}
@@ -170,8 +219,6 @@ def detect_disabled_agents(config: dict) -> List[Dict]:
     Returns:
         List of dicts with keys: task_id, label, exit_code, status
     """
-    from lib.task_manager import MONITORING_AGENTS
-
     tasks_config = config.get("tasks", {})
     all_ids = list(tasks_config.keys()) + [a for a in MONITORING_AGENTS if a not in tasks_config]
 
@@ -541,6 +588,240 @@ def _attempt_llm_self_diagnosis(agent_id: str, status: dict) -> bool:
         return False
 
 
+def _load_task_diagnosis_state() -> dict:
+    """Load per-task diagnosis tracking state from disk."""
+    if TASK_DIAGNOSIS_STATE_FILE.exists():
+        try:
+            with open(TASK_DIAGNOSIS_STATE_FILE, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return {}
+
+
+def _save_task_diagnosis_state(state: dict) -> None:
+    """Save per-task diagnosis tracking state to disk."""
+    state_module.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(TASK_DIAGNOSIS_STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def _record_task_detection(task_id: str, state: dict, problem: str) -> dict:
+    """Record a heartbeat detection of a task anomaly (stale/disabled/stuck)."""
+    now = datetime.now().isoformat()
+    if task_id not in state:
+        state[task_id] = {
+            "consecutive_detections": 0,
+            "first_detected": now,
+            "last_detected": now,
+            "detected_problem": problem,
+            "diagnosis_attempted": False,
+            "last_diagnosis": None,
+            "recovery_attempts": 0,
+        }
+    entry = state[task_id]
+    entry["consecutive_detections"] += 1
+    entry["last_detected"] = now
+    entry["detected_problem"] = problem
+    entry["recovery_attempts"] += 1
+    return state
+
+
+def _should_attempt_task_diagnosis(task_id: str, state: dict) -> bool:
+    """Check if we should invoke LLM diagnosis for a task.
+
+    Requires TASK_DIAGNOSIS_MIN_DETECTIONS consecutive detections
+    and respects TASK_DIAGNOSIS_COOLDOWN_HOURS between attempts.
+    """
+    entry = state.get(task_id, {})
+
+    if entry.get("consecutive_detections", 0) < TASK_DIAGNOSIS_MIN_DETECTIONS:
+        return False
+
+    last_diagnosis = entry.get("last_diagnosis")
+    if last_diagnosis:
+        try:
+            last_dt = datetime.fromisoformat(last_diagnosis)
+            hours_since = (datetime.now() - last_dt).total_seconds() / 3600
+            if hours_since < TASK_DIAGNOSIS_COOLDOWN_HOURS:
+                return False
+        except (ValueError, TypeError):
+            pass
+
+    return True
+
+
+def _clear_task_diagnosis(task_id: str, state: dict) -> dict:
+    """Clear diagnosis state for a task (after recovery)."""
+    if task_id in state:
+        del state[task_id]
+    return state
+
+
+def _attempt_task_diagnosis(task_id: str, task_config: dict,
+                            detected_problem: str, diagnosis_state: dict) -> bool:
+    """Invoke LLM to diagnose and fix a task-level issue.
+
+    Uses the task's on_diagnose config if present, otherwise falls back
+    to the default TASK_DIAGNOSE_PROMPT.
+
+    Returns True if the task appears healthy after diagnosis.
+    """
+    log_dir = PROJECT_ROOT / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    entry = diagnosis_state.get(task_id, {})
+    on_diagnose = task_config.get("on_diagnose", {})
+
+    # Load task state for context
+    task_state = _load_state(task_id)
+    launchd_status = _get_launchd_status(task_id)
+
+    # Build template variables
+    template_vars = {
+        "task_id": task_id,
+        "task_name": task_config.get("name", task_id),
+        "detected_problem": detected_problem,
+        "command": f"{task_config.get('command', '')} {' '.join(str(a) for a in task_config.get('args', []))}".strip(),
+        "working_dir": task_config.get("working_dir", str(PROJECT_ROOT)),
+        "schedule": task_config.get("schedule", "unknown"),
+        "last_run": task_state.last_run or "never",
+        "consecutive_failures": str(task_state.consecutive_failures),
+        "launchd_status": json.dumps(launchd_status, indent=2),
+        "recovery_attempts": str(entry.get("recovery_attempts", 0)),
+        "log_dir": str(log_dir),
+        "log_file": str(log_dir / "pinglet.log"),
+        "stderr_file": str(log_dir / f"{task_id}.err"),
+        "stdout_file": str(log_dir / f"{task_id}.log"),
+        "state_file": str(PROJECT_ROOT / "state" / f"{task_id}.json"),
+        "learning_file": str(LEARNING_FILE),
+        "project_root": str(PROJECT_ROOT),
+        "python_path": str(PROJECT_ROOT / "venv" / "bin" / "python"),
+    }
+
+    # Build prompt — use on_diagnose config or default
+    if on_diagnose.get("command"):
+        # Custom on_diagnose callback
+        callback_cmd = on_diagnose["command"]
+        callback_args = list(on_diagnose.get("args", []))
+        callback_timeout = on_diagnose.get("timeout", 300)
+        callback_max_turns = on_diagnose.get("max_turns", 10)
+        callback_max_budget = on_diagnose.get("max_budget_usd", 3.00)
+        callback_allowed_tools = on_diagnose.get("allowed_tools",
+                                                  "Read,Bash,Edit,Grep,Glob")
+        callback_working_dir = on_diagnose.get("working_dir",
+                                                task_config.get("working_dir", str(PROJECT_ROOT)))
+
+        # Substitute template variables in args
+        resolved_args = []
+        for arg in callback_args:
+            resolved = str(arg)
+            for key, value in template_vars.items():
+                resolved = resolved.replace("{" + key + "}", value)
+            resolved_args.append(resolved)
+
+        cmd = [callback_cmd] + resolved_args
+
+        # Add claude best-practice flags
+        if callback_cmd in ("claude", "/opt/homebrew/bin/claude"):
+            cmd.extend([
+                "--allowedTools", callback_allowed_tools,
+                "--output-format", "json",
+                "--max-turns", str(callback_max_turns),
+                "--max-budget-usd", str(callback_max_budget),
+                "--no-session-persistence",
+            ])
+    else:
+        # Default: use TASK_DIAGNOSE_PROMPT with claude
+        prompt = TASK_DIAGNOSE_PROMPT
+        for key, value in template_vars.items():
+            prompt = prompt.replace("{" + key + "}", value)
+
+        callback_timeout = 300
+        callback_working_dir = task_config.get("working_dir", str(PROJECT_ROOT))
+
+        cmd = [
+            "claude",
+            "-p", prompt,
+            "--allowedTools", "Read,Bash,Edit,Grep,Glob",
+            "--output-format", "json",
+            "--max-turns", "10",
+            "--max-budget-usd", "3.00",
+            "--no-session-persistence",
+        ]
+
+    log(f"Invoking task diagnosis for {task_id} ({detected_problem})", "heartbeat")
+
+    # Record attempt
+    entry["diagnosis_attempted"] = True
+    entry["last_diagnosis"] = datetime.now().isoformat()
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=callback_timeout,
+            cwd=callback_working_dir,
+        )
+
+        # Log output
+        log_file = log_dir / f"{task_id}-on_diagnose.log"
+        with open(log_file, "w") as f:
+            f.write(f"Timestamp: {datetime.now().isoformat()}\n")
+            f.write(f"Problem: {detected_problem}\n")
+            f.write(f"Exit code: {result.returncode}\n")
+            f.write(f"Command: {' '.join(cmd[:6])}...\n")
+            f.write(f"\n--- STDOUT ---\n{result.stdout}\n")
+            f.write(f"\n--- STDERR ---\n{result.stderr}\n")
+
+        if result.returncode == 0:
+            # Verify task is actually healthy now
+            new_status = _get_launchd_status(task_id)
+
+            # Consider it fixed if: not disabled AND (just ran OR was stale and no longer failing)
+            if not new_status.get("disabled"):
+                log(f"Task diagnosis fixed {task_id}", "heartbeat")
+                _update_task_learning(task_id, "diagnosed_fixed", {
+                    "problem": detected_problem,
+                    "summary": _extract_llm_summary(result.stdout),
+                })
+                return True
+
+            log(f"Task diagnosis claimed success but {task_id} still has issues", "heartbeat")
+            _update_task_learning(task_id, "diagnosed_failed", {
+                "problem": detected_problem,
+                "error_pattern": "LLM exit 0 but task still unhealthy",
+            })
+            return False
+        else:
+            log(f"Task diagnosis failed for {task_id} (exit {result.returncode})", "heartbeat")
+            _update_task_learning(task_id, "diagnosed_failed", {
+                "problem": detected_problem,
+                "error_pattern": f"LLM exit {result.returncode}",
+            })
+            return False
+
+    except subprocess.TimeoutExpired:
+        log(f"Task diagnosis timed out for {task_id}", "heartbeat")
+        return False
+    except FileNotFoundError:
+        log(f"claude CLI not found — cannot run task diagnosis", "heartbeat")
+        return False
+    except Exception as e:
+        log(f"Task diagnosis error for {task_id}: {e}", "heartbeat")
+        return False
+
+
+def _extract_llm_summary(stdout: str) -> str:
+    """Extract a summary from LLM JSON output, or first 200 chars of text."""
+    try:
+        parsed = json.loads(stdout)
+        return str(parsed.get("result", ""))[:200]
+    except (json.JSONDecodeError, TypeError):
+        return (stdout or "")[:200]
+
+
 def _load_learning_state() -> dict:
     """Load learning state from disk."""
     if LEARNING_FILE.exists():
@@ -654,12 +935,12 @@ def _detect_and_adapt(entry: dict) -> None:
 
 
 def _update_task_learning(task_id: str, outcome: str, details: dict = None) -> None:
-    """Update learning state after an on_failure callback.
+    """Update learning state after an on_failure or on_diagnose callback.
 
     Args:
         task_id: Task identifier
-        outcome: One of "invoked", "fixed", "failed"
-        details: Optional details (error patterns, etc.)
+        outcome: One of "invoked", "fixed", "failed", "diagnosed_fixed", "diagnosed_failed"
+        details: Optional details (error patterns, diagnoses, etc.)
     """
     state = _load_learning_state()
     tasks = state.setdefault("tasks", {})
@@ -684,6 +965,30 @@ def _update_task_learning(task_id: str, outcome: str, details: dict = None) -> N
     elif outcome == "failed":
         entry["total_on_failure_invocations"] += 1
         # Record failure pattern if provided
+        if details and details.get("error_pattern"):
+            pattern = details["error_pattern"][:200]
+            if pattern not in entry["failure_patterns"]:
+                entry["failure_patterns"].append(pattern)
+    elif outcome == "diagnosed_fixed":
+        entry.setdefault("total_diagnose_invocations", 0)
+        entry["total_diagnose_invocations"] += 1
+        entry.setdefault("total_diagnose_fixes", 0)
+        entry["total_diagnose_fixes"] += 1
+        # Record diagnosis details
+        if details:
+            diagnosis_record = {
+                "ts": datetime.now().isoformat(),
+                "problem": details.get("problem", "unknown"),
+                "summary": details.get("summary", "")[:200],
+                "exit_code": 0,
+            }
+            entry.setdefault("diagnoses", [])
+            entry["diagnoses"].append(diagnosis_record)
+            # Keep only last 10 diagnoses
+            entry["diagnoses"] = entry["diagnoses"][-10:]
+    elif outcome == "diagnosed_failed":
+        entry.setdefault("total_diagnose_invocations", 0)
+        entry["total_diagnose_invocations"] += 1
         if details and details.get("error_pattern"):
             pattern = details["error_pattern"][:200]
             if pattern not in entry["failure_patterns"]:
@@ -871,13 +1176,27 @@ def run_heartbeat(config: dict, wake_delay: Optional[int] = None) -> dict:
                 log(f"Agent {agent_id} is in a reload cycle, escalating", "heartbeat")
                 _update_learning_state(agent_id, "reload_cycle")
 
-            # Tier 2: LLM self-diagnosis (after auto-recovery fails, attempt once)
+            # Tier 2: LLM diagnosis (after auto-recovery fails, attempt once)
             if not entry.get("llm_diagnosis_attempted", False):
                 entry["llm_diagnosis_attempted"] = True
-                llm_success = _attempt_llm_self_diagnosis(agent_id, agent_info)
+
+                # Use task-level diagnosis for regular tasks, monitoring-level for agents
+                is_monitoring = agent_id in MONITORING_AGENTS
+                tasks_config = config.get("tasks", {})
+
+                if is_monitoring:
+                    llm_success = _attempt_llm_self_diagnosis(agent_id, agent_info)
+                elif agent_id in tasks_config:
+                    llm_success = _attempt_task_diagnosis(
+                        agent_id, tasks_config[agent_id],
+                        f"disabled (exit {agent_info.get('exit_code', '?')})",
+                        monitoring_down_state,
+                    )
+                else:
+                    llm_success = _attempt_llm_self_diagnosis(agent_id, agent_info)
 
                 if llm_success:
-                    log(f"LLM self-diagnosis fixed {agent_id}", "heartbeat")
+                    log(f"LLM diagnosis fixed {agent_id}", "heartbeat")
                     monitoring_down_state = _clear_monitoring_down(agent_id, monitoring_down_state)
                     _update_learning_state(agent_id, "llm_recovery", {"summary": f"LLM fixed {agent_id} after auto-recovery failed"})
                     continue
@@ -912,13 +1231,21 @@ def run_heartbeat(config: dict, wake_delay: Optional[int] = None) -> dict:
 
     if not missed_tasks and not disabled:
         log("All tasks up to date", "heartbeat")
-        return {"missed_count": 0, "tasks": [], "disabled_agents": []}
+        return {"missed_count": 0, "tasks": [], "disabled_agents": [], "task_diagnoses": 0}
 
     # Detect and recover stale launchd calendar triggers
     stale_triggers_recovered = 0
+    task_diagnoses_attempted = 0
+    task_diagnoses_fixed = 0
+    tasks_config = config.get("tasks", {})
+
+    # Load task diagnosis tracking state
+    task_diagnosis_state = _load_task_diagnosis_state()
+
     if missed_tasks:
         log(f"Found {len(missed_tasks)} missed task(s)", "heartbeat")
 
+        # Tier 1: Stale trigger recovery (bounce launchd)
         stale = detect_stale_triggers(missed_tasks)
         for task in stale:
             task_name = task["task_name"]
@@ -927,15 +1254,51 @@ def run_heartbeat(config: dict, wake_delay: Optional[int] = None) -> dict:
                 stale_triggers_recovered += 1
                 log(f"Recovered stale trigger for {task_name}", "heartbeat")
 
+        # Tier 2: Task-level LLM diagnosis for persistently missed tasks
+        tasks_to_remove = []
+        for task in missed_tasks:
+            task_name = task["task_name"]
+
+            # Track detection
+            task_diagnosis_state = _record_task_detection(
+                task_name, task_diagnosis_state,
+                f"stale ({task['hours_overdue']:.0f}h overdue)",
+            )
+
+            # Check if we should attempt LLM diagnosis
+            if task_name in tasks_config and _should_attempt_task_diagnosis(task_name, task_diagnosis_state):
+                task_diagnoses_attempted += 1
+                llm_success = _attempt_task_diagnosis(
+                    task_name, tasks_config[task_name],
+                    f"stale ({task['hours_overdue']:.0f}h overdue, schedule: {tasks_config[task_name].get('schedule', '?')})",
+                    task_diagnosis_state,
+                )
+                if llm_success:
+                    task_diagnoses_fixed += 1
+                    task_diagnosis_state = _clear_task_diagnosis(task_name, task_diagnosis_state)
+                    tasks_to_remove.append(task_name)
+                    log(f"Task diagnosis fixed {task_name}", "heartbeat")
+
+        # Remove fixed tasks from missed list (no need to alert)
+        missed_tasks = [t for t in missed_tasks if t["task_name"] not in tasks_to_remove]
+
+    # Clear diagnosis state for tasks that are no longer missed
+    missed_ids = {t["task_name"] for t in missed_tasks}
+    for task_id in list(task_diagnosis_state.keys()):
+        if task_id not in missed_ids:
+            task_diagnosis_state = _clear_task_diagnosis(task_id, task_diagnosis_state)
+
+    _save_task_diagnosis_state(task_diagnosis_state)
+
     # Wait for wake delay (allows system to stabilize after wake)
-    if wake_delay > 0 and missed_tasks:
+    if wake_delay is not None and wake_delay > 0 and missed_tasks:
         log(f"Waiting {wake_delay}s wake delay before notifying", "heartbeat")
         time.sleep(wake_delay)
 
     # Load per-task alert cooldown state
     alert_state = _load_heartbeat_alert_state()
 
-    # Send notifications for each missed task
+    # Tier 3: Send notifications for remaining missed tasks
     for task in missed_tasks:
         task_name = task["task_name"]
         display_name = task["display_name"]
@@ -998,4 +1361,6 @@ _Use macOS notification to Run or Ignore_"""
         "tasks": missed_tasks,
         "disabled_agents": disabled,
         "stale_triggers_recovered": stale_triggers_recovered,
+        "task_diagnoses_attempted": task_diagnoses_attempted,
+        "task_diagnoses_fixed": task_diagnoses_fixed,
     }

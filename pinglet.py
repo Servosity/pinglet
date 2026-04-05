@@ -655,6 +655,16 @@ def _build_task_config_from_args(args) -> dict:
         if args.on_failure_max_turns:
             on_failure["max_turns"] = args.on_failure_max_turns
         config["on_failure"] = on_failure
+    # on_diagnose callback
+    if args.on_diagnose_command:
+        on_diagnose = {"command": args.on_diagnose_command}
+        if args.on_diagnose_prompt:
+            on_diagnose["args"] = ["-p", args.on_diagnose_prompt]
+        if args.on_diagnose_timeout:
+            on_diagnose["timeout"] = args.on_diagnose_timeout
+        if args.on_diagnose_max_turns:
+            on_diagnose["max_turns"] = args.on_diagnose_max_turns
+        config["on_diagnose"] = on_diagnose
     return config
 
 
@@ -805,6 +815,10 @@ CONFIG FLAGS (use with --task-add or --task-edit):
   --on-failure-prompt TEXT   Prompt for on_failure (supports {template_vars})
   --on-failure-timeout SECS  Timeout for on_failure callback (default: 180)
   --on-failure-max-turns N   Max turns for on_failure LLM (default: 5)
+  --on-diagnose-command CMD  Command for anomaly diagnosis (e.g. 'claude')
+  --on-diagnose-prompt TEXT  Prompt for on_diagnose (supports {template_vars})
+  --on-diagnose-timeout SECS Timeout for on_diagnose callback (default: 300)
+  --on-diagnose-max-turns N  Max turns for on_diagnose LLM (default: 10)
 
 SCHEDULE SYNTAX:
   every 1h                   Every hour (StartInterval)
@@ -1080,6 +1094,12 @@ def main():
     parser.add_argument("--on-failure-prompt", help="Prompt for on_failure command (supports {template_vars})")
     parser.add_argument("--on-failure-timeout", type=int, help="Timeout for on_failure callback (default: 180)")
     parser.add_argument("--on-failure-max-turns", type=int, help="Max turns for on_failure (default: 5)")
+
+    # on_diagnose callback flags (for --task-add and --task-edit)
+    parser.add_argument("--on-diagnose-command", help="Command for anomaly diagnosis (e.g. 'claude')")
+    parser.add_argument("--on-diagnose-prompt", help="Prompt for on_diagnose (supports {template_vars})")
+    parser.add_argument("--on-diagnose-timeout", type=int, help="Timeout for on_diagnose callback (default: 300)")
+    parser.add_argument("--on-diagnose-max-turns", type=int, help="Max turns for on_diagnose (default: 10)")
 
     # Status command
     parser.add_argument("--status", action="store_true", help="System status JSON (agent-parseable)")
