@@ -861,16 +861,62 @@ class TestTaskDiagnosisState:
 
         assert state["clawdbot-sync"]["consecutive_detections"] == 3
 
-    def test_clear_task_diagnosis_removes_entry(self):
-        """Clearing removes the task from state."""
+    def test_clear_task_diagnosis_soft_clears_entry(self):
+        """Soft clear preserves entry but resets counters and sets fixed_at."""
         from lib.heartbeat import _record_task_detection, _clear_task_diagnosis
 
         state = {}
-        state = _record_task_detection("clawdbot-sync", state, "stale")
-        assert "clawdbot-sync" in state
+        state = _record_task_detection("clawdbot-sync", state, "stale (2h overdue)")
+        state = _record_task_detection("clawdbot-sync", state, "stale (2h overdue)")
+        assert state["clawdbot-sync"]["consecutive_detections"] == 2
 
         state = _clear_task_diagnosis("clawdbot-sync", state)
-        assert "clawdbot-sync" not in state
+
+        # Entry still exists (soft clear)
+        assert "clawdbot-sync" in state
+        entry = state["clawdbot-sync"]
+        # Counters reset
+        assert entry["consecutive_detections"] == 0
+        assert entry["diagnosis_attempted"] is False
+        assert entry["last_diagnosis"] is None
+        # Fixed timestamp set
+        assert entry["fixed_at"] is not None
+        # Fix summary captured from detected_problem
+        assert entry["last_fix_summary"] == "stale (2h overdue)"
+
+    def test_recurring_fix_increments_on_redetection(self):
+        """Re-detecting within 24h of fix increments recurring_fix_failures."""
+        from lib.heartbeat import _record_task_detection, _clear_task_diagnosis
+
+        state = {}
+        state = _record_task_detection("test-task", state, "stale")
+        state = _clear_task_diagnosis("test-task", state)
+        assert state["test-task"]["recurring_fix_failures"] == 0
+
+        # Re-detect immediately (within 24h)
+        state = _record_task_detection("test-task", state, "stale")
+        assert state["test-task"]["recurring_fix_failures"] == 1
+
+        # Fix and break again
+        state = _clear_task_diagnosis("test-task", state)
+        state = _record_task_detection("test-task", state, "stale")
+        assert state["test-task"]["recurring_fix_failures"] == 2
+
+    def test_recurring_fix_skips_after_24h(self):
+        """Re-detecting after 24h of fix does NOT increment recurring_fix_failures."""
+        from lib.heartbeat import _record_task_detection, _clear_task_diagnosis
+
+        state = {}
+        state = _record_task_detection("test-task", state, "stale")
+        state = _clear_task_diagnosis("test-task", state)
+
+        # Backdate fixed_at to 25h ago
+        state["test-task"]["fixed_at"] = (
+            datetime.now() - timedelta(hours=25)
+        ).isoformat()
+
+        state = _record_task_detection("test-task", state, "stale")
+        assert state["test-task"]["recurring_fix_failures"] == 0
 
     def test_should_attempt_below_threshold(self):
         """Should not attempt diagnosis below TASK_DIAGNOSIS_MIN_DETECTIONS."""
@@ -918,6 +964,43 @@ class TestTaskDiagnosisState:
         }
         # 7 hours ago > 6h cooldown
         assert _should_attempt_task_diagnosis("test-task", state) is True
+
+    def test_exponential_backoff_with_recurring_failures(self):
+        """Cooldown doubles for each recurring fix failure."""
+        from lib.heartbeat import _should_attempt_task_diagnosis
+
+        # recurring=2 → cooldown = 6 * 2^2 = 24h
+        state = {
+            "test-task": {
+                "consecutive_detections": 5,
+                "recurring_fix_failures": 2,
+                "last_diagnosis": (datetime.now() - timedelta(hours=12)).isoformat(),
+                "detected_problem": "stale",
+            },
+        }
+        # 12h < 24h cooldown → should NOT attempt
+        assert _should_attempt_task_diagnosis("test-task", state) is False
+
+        # 25h ago > 24h cooldown → should attempt
+        state["test-task"]["last_diagnosis"] = (
+            datetime.now() - timedelta(hours=25)
+        ).isoformat()
+        assert _should_attempt_task_diagnosis("test-task", state) is True
+
+    def test_chronic_threshold_stops_llm(self):
+        """At chronic threshold, LLM diagnosis is blocked entirely."""
+        from lib.heartbeat import _should_attempt_task_diagnosis
+
+        state = {
+            "test-task": {
+                "consecutive_detections": 10,
+                "recurring_fix_failures": 5,  # At chronic threshold
+                "last_diagnosis": (datetime.now() - timedelta(hours=999)).isoformat(),
+                "detected_problem": "stale",
+            },
+        }
+        # Should NOT attempt even though cooldown is well expired
+        assert _should_attempt_task_diagnosis("test-task", state) is False
 
 
 class TestTaskDiagnosisInvocation:
@@ -1057,6 +1140,103 @@ class TestTaskDiagnosisInvocation:
                 "test-task", task_config, "disabled", {},
             )
             assert result is False
+
+    def test_recurring_context_prepended_to_prompt(self, tmp_path):
+        """With recurring_fix_failures > 0, prompt includes RECURRING FAILURE warning."""
+        logs_dir = tmp_path / "logs"
+        logs_dir.mkdir()
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+
+        task_config = {
+            "name": "Clawdbot Sync",
+            "command": "/bin/bash",
+            "args": ["sync.sh"],
+            "working_dir": "/tmp/clawdbot",
+            "schedule": "hourly :22",
+        }
+
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.stdout = '{"result": "Switched to StartInterval"}'
+        mock_proc.stderr = ""
+
+        healthy_status = {"installed": True, "running": False, "exit_code": 0, "disabled": False, "status": "idle"}
+        mock_state = MockTaskState(task_name="clawdbot-sync", last_run="2026-04-06T10:00:00")
+
+        learning_state = {"version": 1, "agents": {}, "tasks": {
+            "clawdbot-sync": {"total_diagnose_invocations": 15}
+        }}
+
+        with patch("subprocess.run", return_value=mock_proc) as mock_run, \
+             patch("lib.heartbeat._get_launchd_status", return_value=healthy_status), \
+             patch("lib.heartbeat._load_state", return_value=mock_state), \
+             patch("lib.heartbeat._load_learning_state", return_value=learning_state), \
+             patch("lib.heartbeat._update_task_learning"), \
+             patch("lib.heartbeat.PROJECT_ROOT", tmp_path), \
+             patch("lib.heartbeat.LEARNING_FILE", state_dir / "_learning.json"), \
+             patch("lib.heartbeat.log"):
+            from lib.heartbeat import _attempt_task_diagnosis
+
+            diagnosis_state = {
+                "clawdbot-sync": {
+                    "recovery_attempts": 5,
+                    "recurring_fix_failures": 3,
+                    "last_fix_summary": "stale trigger re-bootstrapped",
+                },
+            }
+            result = _attempt_task_diagnosis(
+                "clawdbot-sync", task_config,
+                "stale (2h overdue)",
+                diagnosis_state,
+            )
+
+            assert result is True
+            cmd = mock_run.call_args[0][0]
+            prompt = cmd[cmd.index("-p") + 1]
+            assert "RECURRING FAILURE" in prompt
+            assert "DIFFERENT approach" in prompt
+            assert "3 time(s)" in prompt
+            assert "stale trigger re-bootstrapped" in prompt
+
+    def test_no_recurring_context_at_zero_failures(self, tmp_path):
+        """With recurring_fix_failures == 0, no RECURRING FAILURE prefix."""
+        logs_dir = tmp_path / "logs"
+        logs_dir.mkdir()
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+
+        task_config = {
+            "name": "Test Task",
+            "command": "/bin/echo",
+            "working_dir": "/tmp",
+            "schedule": "daily 7:00",
+        }
+
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.stdout = '{"result": "Fixed"}'
+        mock_proc.stderr = ""
+
+        healthy_status = {"installed": True, "running": False, "exit_code": 0, "disabled": False, "status": "idle"}
+        mock_state = MockTaskState(task_name="test-task")
+
+        with patch("subprocess.run", return_value=mock_proc) as mock_run, \
+             patch("lib.heartbeat._get_launchd_status", return_value=healthy_status), \
+             patch("lib.heartbeat._load_state", return_value=mock_state), \
+             patch("lib.heartbeat._load_learning_state", return_value={"version": 1, "agents": {}, "tasks": {}}), \
+             patch("lib.heartbeat._update_task_learning"), \
+             patch("lib.heartbeat.PROJECT_ROOT", tmp_path), \
+             patch("lib.heartbeat.LEARNING_FILE", state_dir / "_learning.json"), \
+             patch("lib.heartbeat.log"):
+            from lib.heartbeat import _attempt_task_diagnosis
+
+            diagnosis_state = {"test-task": {"recovery_attempts": 1, "recurring_fix_failures": 0}}
+            _attempt_task_diagnosis("test-task", task_config, "stale", diagnosis_state)
+
+            cmd = mock_run.call_args[0][0]
+            prompt = cmd[cmd.index("-p") + 1]
+            assert "RECURRING FAILURE" not in prompt
 
 
 class TestTaskDiagnosisLearning:

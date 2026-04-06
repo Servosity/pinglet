@@ -98,8 +98,8 @@ class TestMissedTaskDetection:
             assert len(uce_missed) == 1
             assert uce_missed[0]["never_run"] is True
 
-    def test_filter_ignored_tasks(self, sample_config):
-        """Test that ignored tasks are filtered out."""
+    def test_ignored_tasks_still_detected_with_flag(self, sample_config):
+        """Ignored tasks appear in missed list with ignored=True."""
         old_time = datetime.now() - timedelta(hours=20)
 
         mock_state = MockTaskState(
@@ -117,7 +117,27 @@ class TestMissedTaskDetection:
             missed = detect_missed_tasks(sample_config)
 
             uce_missed = [m for m in missed if m["task_name"] == "uce"]
-            assert len(uce_missed) == 0
+            assert len(uce_missed) == 1
+            assert uce_missed[0]["ignored"] is True
+
+    def test_non_ignored_tasks_have_ignored_false(self, sample_config):
+        """Non-ignored tasks have ignored=False in missed list."""
+        old_time = datetime.now() - timedelta(hours=20)
+
+        mock_state = MockTaskState(
+            task_name="uce",
+            last_run=old_time.isoformat(),
+        )
+
+        with patch("lib.heartbeat._load_state", return_value=mock_state), \
+             patch("lib.heartbeat._is_ignored", return_value=False):
+            from lib.heartbeat import detect_missed_tasks
+
+            missed = detect_missed_tasks(sample_config)
+
+            uce_missed = [m for m in missed if m["task_name"] == "uce"]
+            assert len(uce_missed) == 1
+            assert uce_missed[0]["ignored"] is False
 
 
 class TestHeartbeatExecution:

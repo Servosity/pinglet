@@ -38,6 +38,11 @@ def _load_ignored() -> dict:
     return ignored_module.load_ignored()
 
 
+def _clear_stale_ignores() -> list:
+    """Wrapper for clear_stale_ignores to allow patching."""
+    return ignored_module.clear_stale_ignores()
+
+
 def _send_missed_task_notification(task_name, display_name, hours_overdue, threshold):
     """Wrapper for send_missed_task_notification to allow patching."""
     return alerts_module.send_missed_task_notification(task_name, display_name, hours_overdue, threshold)
@@ -80,6 +85,8 @@ LEARNING_FILE = LEARNING_STATE_FILE  # Alias for test patching
 TASK_DIAGNOSIS_STATE_FILE = state_module.STATE_DIR / "_task_diagnosis.json"
 TASK_DIAGNOSIS_COOLDOWN_HOURS = 6  # Don't re-invoke LLM more than once per 6h per task
 TASK_DIAGNOSIS_MIN_DETECTIONS = 2  # Need 2+ heartbeat detections before invoking LLM
+TASK_DIAGNOSIS_CHRONIC_THRESHOLD = 5  # After this many recurring fix failures, stop LLM and alert human
+TASK_FIX_DURABILITY_HOURS = 24  # If task re-breaks within this window after a "fix", it's recurring
 
 # Task-level diagnosis prompt — for regular tasks (not monitoring agents)
 # Unlike SELF_DIAGNOSIS_PROMPT, this allows fixing the working directory and dependencies
@@ -123,6 +130,22 @@ RULES:
 - Do NOT modify other tasks or their working directories
 - Do NOT delete data files unless they are clearly corrupt temp files
 - Exit 0 if fixed (task runs successfully). Exit 1 if human intervention needed."""
+
+# Prepended to TASK_DIAGNOSE_PROMPT when a previous fix didn't stick
+RECURRING_FAILURE_CONTEXT = """
+WARNING - RECURRING FAILURE: This task has been "fixed" {recurring_fix_failures} time(s) but keeps breaking.
+Previous fix attempt: {last_fix_summary}
+Total LLM diagnosis invocations for this task: {total_diagnose_invocations}
+
+The previous approach did NOT persist. The standard re-bootstrap approach is NOT working.
+
+You MUST try a DIFFERENT approach than re-bootstrapping. Consider:
+- If this is a stale StartCalendarInterval: switch the plist to use StartInterval (seconds-based)
+- If this is a permission or environment issue: check for machine-level changes
+- If the task script itself is broken: fix the script, not just the schedule
+- If the working directory has issues (git state, missing deps): fix those
+- If you cannot fix the root cause: exit 1 to escalate to human intervention
+"""
 
 # Self-diagnosis prompt (monitoring agents only — restricted to plist fixes)
 SELF_DIAGNOSIS_PROMPT = """Pinglet monitoring agent '{agent_id}' is DOWN. Fix it.
@@ -607,7 +630,11 @@ def _save_task_diagnosis_state(state: dict) -> None:
 
 
 def _record_task_detection(task_id: str, state: dict, problem: str) -> dict:
-    """Record a heartbeat detection of a task anomaly (stale/disabled/stuck)."""
+    """Record a heartbeat detection of a task anomaly (stale/disabled/stuck).
+
+    If the task was recently "fixed" (within TASK_FIX_DURABILITY_HOURS),
+    increments recurring_fix_failures to track that the fix didn't stick.
+    """
     now = datetime.now().isoformat()
     if task_id not in state:
         state[task_id] = {
@@ -618,8 +645,28 @@ def _record_task_detection(task_id: str, state: dict, problem: str) -> dict:
             "diagnosis_attempted": False,
             "last_diagnosis": None,
             "recovery_attempts": 0,
+            "fixed_at": None,
+            "recurring_fix_failures": 0,
+            "last_fix_summary": "",
         }
     entry = state[task_id]
+
+    # Check if this is a recurrence after a "fix"
+    fixed_at = entry.get("fixed_at")
+    if fixed_at:
+        try:
+            fixed_dt = datetime.fromisoformat(fixed_at)
+            now_dt = datetime.fromisoformat(now)
+            hours_since_fix = (now_dt - fixed_dt).total_seconds() / 3600
+            if hours_since_fix <= TASK_FIX_DURABILITY_HOURS:
+                entry["recurring_fix_failures"] = entry.get("recurring_fix_failures", 0) + 1
+                log(f"Recurring fix failure for {task_id} "
+                    f"(broke again {hours_since_fix:.1f}h after fix, "
+                    f"count={entry['recurring_fix_failures']})", "heartbeat")
+        except (ValueError, TypeError):
+            pass
+        entry["fixed_at"] = None  # Clear so we don't double-count
+
     entry["consecutive_detections"] += 1
     entry["last_detected"] = now
     entry["detected_problem"] = problem
@@ -631,19 +678,31 @@ def _should_attempt_task_diagnosis(task_id: str, state: dict) -> bool:
     """Check if we should invoke LLM diagnosis for a task.
 
     Requires TASK_DIAGNOSIS_MIN_DETECTIONS consecutive detections
-    and respects TASK_DIAGNOSIS_COOLDOWN_HOURS between attempts.
+    and respects cooldown between attempts. Uses exponential backoff
+    when recurring_fix_failures indicates previous fixes didn't stick.
+    Stops LLM entirely at TASK_DIAGNOSIS_CHRONIC_THRESHOLD.
     """
     entry = state.get(task_id, {})
 
     if entry.get("consecutive_detections", 0) < TASK_DIAGNOSIS_MIN_DETECTIONS:
         return False
 
+    # Chronic failure — stop wasting LLM calls, needs human
+    recurring = entry.get("recurring_fix_failures", 0)
+    if recurring >= TASK_DIAGNOSIS_CHRONIC_THRESHOLD:
+        log(f"Chronic failure for {task_id} ({recurring} recurring fixes failed), "
+            f"skipping LLM diagnosis — needs human", "heartbeat")
+        return False
+
+    # Exponential backoff: 6h → 12h → 24h → 48h → 96h (cap at 168h/1wk)
+    cooldown = min(TASK_DIAGNOSIS_COOLDOWN_HOURS * (2 ** recurring), 168)
+
     last_diagnosis = entry.get("last_diagnosis")
     if last_diagnosis:
         try:
             last_dt = datetime.fromisoformat(last_diagnosis)
             hours_since = (datetime.now() - last_dt).total_seconds() / 3600
-            if hours_since < TASK_DIAGNOSIS_COOLDOWN_HOURS:
+            if hours_since < cooldown:
                 return False
         except (ValueError, TypeError):
             pass
@@ -652,9 +711,19 @@ def _should_attempt_task_diagnosis(task_id: str, state: dict) -> bool:
 
 
 def _clear_task_diagnosis(task_id: str, state: dict) -> dict:
-    """Clear diagnosis state for a task (after recovery)."""
+    """Soft-clear diagnosis state for a task after recovery.
+
+    Preserves recurring_fix_failures and last_fix_summary so that if the
+    task breaks again, we know it's a recurring failure. Sets fixed_at so
+    _record_task_detection can detect re-breakage.
+    """
     if task_id in state:
-        del state[task_id]
+        entry = state[task_id]
+        entry["fixed_at"] = datetime.now().isoformat()
+        entry["last_fix_summary"] = entry.get("detected_problem", "")
+        entry["consecutive_detections"] = 0
+        entry["diagnosis_attempted"] = False
+        entry["last_diagnosis"] = None
     return state
 
 
@@ -697,6 +766,11 @@ def _attempt_task_diagnosis(task_id: str, task_config: dict,
         "learning_file": str(LEARNING_FILE),
         "project_root": str(PROJECT_ROOT),
         "python_path": str(PROJECT_ROOT / "venv" / "bin" / "python"),
+        "recurring_fix_failures": str(entry.get("recurring_fix_failures", 0)),
+        "last_fix_summary": entry.get("last_fix_summary", ""),
+        "total_diagnose_invocations": str(
+            _load_learning_state().get("tasks", {}).get(task_id, {}).get(
+                "total_diagnose_invocations", 0)),
     }
 
     # Build prompt — use on_diagnose config or default
@@ -736,6 +810,14 @@ def _attempt_task_diagnosis(task_id: str, task_config: dict,
         prompt = TASK_DIAGNOSE_PROMPT
         for key, value in template_vars.items():
             prompt = prompt.replace("{" + key + "}", value)
+
+        # Prepend recurring failure context if previous fixes didn't stick
+        recurring = entry.get("recurring_fix_failures", 0)
+        if recurring > 0:
+            context = RECURRING_FAILURE_CONTEXT
+            for key, value in template_vars.items():
+                context = context.replace("{" + key + "}", value)
+            prompt = context + "\n" + prompt
 
         callback_timeout = 300
         callback_working_dir = task_config.get("working_dir", str(PROJECT_ROOT))
@@ -782,9 +864,12 @@ def _attempt_task_diagnosis(task_id: str, task_config: dict,
             # Consider it fixed if: not disabled AND (just ran OR was stale and no longer failing)
             if not new_status.get("disabled"):
                 log(f"Task diagnosis fixed {task_id}", "heartbeat")
+                summary = _extract_llm_summary(result.stdout)
+                # Store summary in diagnosis state for recurring failure tracking
+                entry["last_fix_summary"] = summary[:200]
                 _update_task_learning(task_id, "diagnosed_fixed", {
                     "problem": detected_problem,
-                    "summary": _extract_llm_summary(result.stdout),
+                    "summary": summary,
                 })
                 return True
 
@@ -1044,14 +1129,11 @@ def detect_missed_tasks(config: dict) -> List[Dict]:
     now = datetime.now()
 
     for task_name, threshold in expected_intervals.items():
-        # Skip ignored tasks
-        if _is_ignored(task_name):
-            log(f"Skipping ignored task: {task_name}", "heartbeat")
-            continue
-
         # Load task state
         state = _load_state(task_name)
         display_name = tasks_config.get(task_name, {}).get("name", task_name)
+
+        ignored = _is_ignored(task_name)
 
         if not state.last_run:
             # Task has never run
@@ -1062,6 +1144,7 @@ def detect_missed_tasks(config: dict) -> List[Dict]:
                 "threshold": threshold,
                 "last_run": None,
                 "never_run": True,
+                "ignored": ignored,
             })
             continue
 
@@ -1078,6 +1161,7 @@ def detect_missed_tasks(config: dict) -> List[Dict]:
                     "threshold": threshold,
                     "last_run": state.last_run,
                     "never_run": False,
+                    "ignored": ignored,
                 })
         except ValueError:
             log(f"Invalid last_run timestamp for {task_name}", "heartbeat")
@@ -1142,6 +1226,11 @@ def run_heartbeat(config: dict, wake_delay: Optional[int] = None) -> dict:
         wake_delay = heartbeat_config.get("wake_delay_seconds", 30)
 
     log("Running heartbeat check", "heartbeat")
+
+    # Auto-clear stale ignore entries (older than IGNORE_EXPIRY_HOURS)
+    cleared = _clear_stale_ignores()
+    if cleared:
+        log(f"Auto-cleared {len(cleared)} stale ignore entries: {', '.join(cleared)}", "heartbeat")
 
     # Check for disabled agents with 3-tier recovery cascade
     disabled = detect_disabled_agents(config)
@@ -1282,11 +1371,18 @@ def run_heartbeat(config: dict, wake_delay: Optional[int] = None) -> dict:
         # Remove fixed tasks from missed list (no need to alert)
         missed_tasks = [t for t in missed_tasks if t["task_name"] not in tasks_to_remove]
 
-    # Clear diagnosis state for tasks that are no longer missed
+    # Soft-clear diagnosis state for tasks that are no longer missed.
+    # Preserve recurring failure history for tasks that had diagnosis attempts.
     missed_ids = {t["task_name"] for t in missed_tasks}
     for task_id in list(task_diagnosis_state.keys()):
         if task_id not in missed_ids:
-            task_diagnosis_state = _clear_task_diagnosis(task_id, task_diagnosis_state)
+            entry = task_diagnosis_state[task_id]
+            if entry.get("diagnosis_attempted") or entry.get("recurring_fix_failures", 0) > 0:
+                # Soft clear: preserve recurring failure history
+                task_diagnosis_state = _clear_task_diagnosis(task_id, task_diagnosis_state)
+            else:
+                # Hard clear: no diagnosis history worth preserving
+                del task_diagnosis_state[task_id]
 
     _save_task_diagnosis_state(task_diagnosis_state)
 
@@ -1297,6 +1393,26 @@ def run_heartbeat(config: dict, wake_delay: Optional[int] = None) -> dict:
 
     # Load per-task alert cooldown state
     alert_state = _load_heartbeat_alert_state()
+
+    # Check for chronic LLM failures that need human escalation
+    for task in missed_tasks:
+        task_name = task["task_name"]
+        diag_entry = task_diagnosis_state.get(task_name, {})
+        recurring = diag_entry.get("recurring_fix_failures", 0)
+        if recurring >= TASK_DIAGNOSIS_CHRONIC_THRESHOLD:
+            chronic_msg = (
+                f"*Pinglet: CHRONIC FAILURE*\n"
+                f"`{task_name}` has been \"fixed\" {recurring} times but keeps breaking.\n"
+                f"Last fix: {diag_entry.get('last_fix_summary', 'unknown')}\n"
+                f"LLM diagnosis suspended — *human intervention required*."
+            )
+            # Send regardless of ignore status — chronic failures always alert
+            if _should_alert_for_task(task_name, "critical", alert_state):
+                _send_slack_message(chronic_msg)
+                alert_state[task_name] = {
+                    "last_alert": datetime.now().isoformat(),
+                    "escalation": "critical",
+                }
 
     # Tier 3: Send notifications for remaining missed tasks
     for task in missed_tasks:
@@ -1309,6 +1425,11 @@ def run_heartbeat(config: dict, wake_delay: Optional[int] = None) -> dict:
         # Determine escalation level
         level = get_escalation_level(hours_overdue, threshold)
         task["escalation"] = level
+
+        # Suppress notifications for ignored tasks (they still get Tier 1+2 recovery)
+        if task.get("ignored", False):
+            log(f"Suppressing notification for ignored task: {task_name}", "heartbeat")
+            continue
 
         level_prefix = ""
         if level == "critical":

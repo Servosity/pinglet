@@ -2,17 +2,19 @@
 Ignored tasks management for Pinglet.
 
 Tracks tasks that user has chosen to ignore via notification action.
-Ignored tasks are suppressed from heartbeat notifications until next scheduled run.
+Ignored tasks are suppressed from heartbeat notifications but still flow
+through stale-trigger recovery and LLM diagnosis (Tier 1 + 2).
 """
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 # Resolve project root
 PROJECT_ROOT = Path(__file__).parent.parent
 STATE_DIR = PROJECT_ROOT / "state"
 IGNORED_FILE = STATE_DIR / "_ignored.json"
+IGNORE_EXPIRY_HOURS = 48  # Auto-clear ignore entries older than this
 
 
 def ensure_state_dir() -> None:
@@ -123,3 +125,35 @@ def get_ignored_info(task_name: str) -> Optional[dict]:
     """
     ignored = load_ignored()
     return ignored.get(task_name)
+
+
+def clear_stale_ignores() -> List[str]:
+    """
+    Remove ignore entries older than IGNORE_EXPIRY_HOURS.
+
+    Returns:
+        List of task names that were cleared.
+    """
+    ignored = load_ignored()
+    if not ignored:
+        return []
+
+    now = datetime.now()
+    cleared = []
+
+    for task_name, info in list(ignored.items()):
+        if not info or not info.get("ignored_at"):
+            continue
+        try:
+            ignored_at = datetime.fromisoformat(info["ignored_at"])
+            hours_since = (now - ignored_at).total_seconds() / 3600
+            if hours_since > IGNORE_EXPIRY_HOURS:
+                cleared.append(task_name)
+                del ignored[task_name]
+        except (ValueError, TypeError):
+            continue
+
+    if cleared:
+        save_ignored(ignored)
+
+    return cleared

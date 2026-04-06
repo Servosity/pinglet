@@ -139,3 +139,55 @@ class TestIgnoredTasksManager:
             from lib.ignored import is_ignored
 
             assert is_ignored("uce") is False
+
+    def test_clear_stale_ignores_removes_old_entries(self, tmp_path):
+        """Entries older than IGNORE_EXPIRY_HOURS are auto-cleared."""
+        ignored_file = tmp_path / "ignored.json"
+        old_time = (datetime.now() - timedelta(hours=72)).isoformat()
+        recent_time = (datetime.now() - timedelta(hours=1)).isoformat()
+
+        ignored_file.write_text(json.dumps({
+            "old-task": {"ignored_at": old_time, "reason": "old"},
+            "recent-task": {"ignored_at": recent_time, "reason": "recent"},
+        }))
+
+        with patch("lib.ignored.IGNORED_FILE", ignored_file):
+            from lib.ignored import clear_stale_ignores, load_ignored
+
+            cleared = clear_stale_ignores()
+            assert "old-task" in cleared
+            assert "recent-task" not in cleared
+
+            remaining = load_ignored()
+            assert "old-task" not in remaining
+            assert "recent-task" in remaining
+
+    def test_clear_stale_ignores_keeps_recent_entries(self, tmp_path):
+        """Entries younger than IGNORE_EXPIRY_HOURS are preserved."""
+        ignored_file = tmp_path / "ignored.json"
+        recent_time = (datetime.now() - timedelta(hours=12)).isoformat()
+
+        ignored_file.write_text(json.dumps({
+            "task-a": {"ignored_at": recent_time, "reason": "recent"},
+            "task-b": {"ignored_at": recent_time, "reason": "recent"},
+        }))
+
+        with patch("lib.ignored.IGNORED_FILE", ignored_file):
+            from lib.ignored import clear_stale_ignores, load_ignored
+
+            cleared = clear_stale_ignores()
+            assert cleared == []
+
+            remaining = load_ignored()
+            assert len(remaining) == 2
+
+    def test_clear_stale_ignores_handles_empty(self, tmp_path):
+        """Empty ignored file returns empty list."""
+        ignored_file = tmp_path / "ignored.json"
+        ignored_file.write_text(json.dumps({}))
+
+        with patch("lib.ignored.IGNORED_FILE", ignored_file):
+            from lib.ignored import clear_stale_ignores
+
+            cleared = clear_stale_ignores()
+            assert cleared == []
