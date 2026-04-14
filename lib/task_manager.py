@@ -820,6 +820,22 @@ def _get_uid() -> str:
     return subprocess.check_output(["id", "-u"]).decode().strip()
 
 
+def _strip_macl_from_logs(task_id: str) -> None:
+    """Strip com.apple.macl xattr from task log files.
+
+    macOS Sequoia adds Managed Access Control Lists to files, which can
+    prevent launchd from writing to stdout/stderr paths (causing exit 78).
+    Removing the xattr before bootstrap ensures launchd can open the files.
+    """
+    for suffix in (".log", ".err"):
+        log_path = LOGS_DIR / f"{task_id}{suffix}"
+        if log_path.exists():
+            subprocess.run(
+                ["xattr", "-d", "com.apple.macl", str(log_path)],
+                capture_output=True,
+            )
+
+
 def _write_and_install_plist(task_id: str, schedule_dict: dict) -> Path:
     """Generate plist, write to launchagents/, copy to ~/Library/LaunchAgents/, bootstrap."""
     plist_content = generate_plist(task_id, schedule_dict)
@@ -834,6 +850,9 @@ def _write_and_install_plist(task_id: str, schedule_dict: dict) -> Path:
     USER_LAUNCHAGENTS_DIR.mkdir(exist_ok=True)
     user_plist = USER_LAUNCHAGENTS_DIR / f"{label}.plist"
     user_plist.write_text(plist_content)
+
+    # Strip MACL xattrs from log files to prevent launchd exit 78
+    _strip_macl_from_logs(task_id)
 
     # Bootstrap
     uid = _get_uid()

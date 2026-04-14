@@ -15,7 +15,7 @@ from lib import state as state_module
 from lib import ignored as ignored_module
 from lib import alerts as alerts_module
 from lib.logging import log
-from lib.task_manager import MONITORING_AGENTS
+from lib.task_manager import MONITORING_AGENTS, _strip_macl_from_logs
 
 # Re-export for testing patches
 STATE_DIR = state_module.STATE_DIR
@@ -315,6 +315,9 @@ def recover_stale_trigger(task_id: str) -> str:
             capture_output=True, timeout=10,
         )
 
+        # Strip MACL xattrs from log files (prevents launchd exit 78)
+        _strip_macl_from_logs(task_id)
+
         # Bootstrap
         result = subprocess.run(
             ["launchctl", "bootstrap", f"gui/{uid}", str(user_plist)],
@@ -504,6 +507,9 @@ def _attempt_auto_recovery(agent_id: str) -> str:
             ["launchctl", "bootout", f"gui/{uid}/{label}"],
             capture_output=True, timeout=10,
         )
+
+        # Strip MACL xattrs from log files (prevents launchd exit 78)
+        _strip_macl_from_logs(agent_id)
 
         # Bootstrap
         result = subprocess.run(
