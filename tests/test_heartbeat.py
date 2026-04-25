@@ -1170,3 +1170,152 @@ class TestStaleLaunchdTriggerDetection:
 
             mock_recover.assert_called_once_with("obsidian-tab-archiver")
             assert result.get("stale_triggers_recovered", 0) >= 1
+
+
+class TestStaleRecoveryCooldown:
+    """Bug fix: stale trigger recovery must not repeat every heartbeat cycle.
+
+    When a weekly task (e.g., pipeline-review) is overdue, the heartbeat detects
+    runs=0 and re-bootstraps it. But re-bootstrapping resets runs to 0, so the
+    NEXT heartbeat cycle sees runs=0 again and re-bootstraps again — an infinite
+    loop that never lets the agent fire on its next scheduled day.
+
+    The fix: after a stale trigger recovery, apply a cooldown equal to the task's
+    expected_interval before attempting another recovery for the same task.
+    """
+
+    def test_first_stale_recovery_always_proceeds(self):
+        """First stale recovery for a task should always be attempted."""
+        from lib.heartbeat import _should_recover_stale_trigger
+
+        # No prior recovery state
+        task_diagnosis_state = {}
+        assert _should_recover_stale_trigger("pipeline-review", task_diagnosis_state, 180) is True
+
+    def test_stale_recovery_blocked_within_cooldown(self):
+        """Stale recovery within expected_interval of last recovery should be blocked."""
+        from lib.heartbeat import _should_recover_stale_trigger
+
+        # Recovery attempted 2 hours ago, expected_interval is 180h
+        recent = (datetime.now() - timedelta(hours=2)).isoformat()
+        task_diagnosis_state = {
+            "pipeline-review": {
+                "last_stale_recovery": recent,
+                "consecutive_detections": 3,
+            }
+        }
+        assert _should_recover_stale_trigger("pipeline-review", task_diagnosis_state, 180) is False
+
+    def test_stale_recovery_allowed_after_cooldown(self):
+        """Stale recovery after expected_interval should be allowed."""
+        from lib.heartbeat import _should_recover_stale_trigger
+
+        # Recovery attempted 200 hours ago, expected_interval is 180h
+        old = (datetime.now() - timedelta(hours=200)).isoformat()
+        task_diagnosis_state = {
+            "pipeline-review": {
+                "last_stale_recovery": old,
+                "consecutive_detections": 10,
+            }
+        }
+        assert _should_recover_stale_trigger("pipeline-review", task_diagnosis_state, 180) is True
+
+    def test_stale_recovery_cooldown_uses_expected_interval(self):
+        """Short-interval tasks (e.g., hourly) should have short cooldowns."""
+        from lib.heartbeat import _should_recover_stale_trigger
+
+        # Recovery 3 hours ago, expected_interval is 1.5h — cooldown expired
+        three_h_ago = (datetime.now() - timedelta(hours=3)).isoformat()
+        state = {"git-sync": {"last_stale_recovery": three_h_ago, "consecutive_detections": 2}}
+        assert _should_recover_stale_trigger("git-sync", state, 1.5) is True
+
+        # Recovery 30 min ago, expected_interval is 1.5h — still in cooldown
+        recent = (datetime.now() - timedelta(minutes=30)).isoformat()
+        state = {"git-sync": {"last_stale_recovery": recent, "consecutive_detections": 2}}
+        assert _should_recover_stale_trigger("git-sync", state, 1.5) is False
+
+    def test_record_stale_recovery_sets_timestamp(self):
+        """_record_stale_recovery should set last_stale_recovery timestamp."""
+        from lib.heartbeat import _record_stale_recovery
+
+        state = {}
+        _record_stale_recovery("pipeline-review", state)
+
+        assert "pipeline-review" in state
+        assert "last_stale_recovery" in state["pipeline-review"]
+        # Timestamp should be recent (within 5 seconds)
+        ts = datetime.fromisoformat(state["pipeline-review"]["last_stale_recovery"])
+        assert (datetime.now() - ts).total_seconds() < 5
+
+    def test_heartbeat_skips_stale_recovery_when_cooldown_active(self, sample_config):
+        """run_heartbeat should NOT re-recover stale triggers within cooldown.
+
+        This is the core regression test for the pipeline-review infinite loop bug.
+        """
+        old_time = datetime.now() - timedelta(hours=200)  # 200h ago — overdue
+        mock_state = MockTaskState(
+            task_name="pipeline-review",
+            last_run=old_time.isoformat(),
+            last_status="success",
+        )
+
+        stale_tasks = [{
+            "task_name": "pipeline-review",
+            "display_name": "Weekly Pipeline Review",
+            "hours_overdue": 20.0,
+            "threshold": 180,
+            "last_run": old_time.isoformat(),
+            "never_run": False,
+        }]
+
+        # Prior recovery 2 hours ago — still within 180h cooldown
+        recent_recovery = (datetime.now() - timedelta(hours=2)).isoformat()
+        task_diag_state = {
+            "pipeline-review": {
+                "consecutive_detections": 3,
+                "first_detected": (datetime.now() - timedelta(hours=3)).isoformat(),
+                "last_detected": datetime.now().isoformat(),
+                "detected_problem": "stale (20h overdue)",
+                "diagnosis_attempted": False,
+                "last_diagnosis": None,
+                "recovery_attempts": 3,
+                "fixed_at": None,
+                "recurring_fix_failures": 0,
+                "last_fix_summary": "",
+                "last_stale_recovery": recent_recovery,
+            }
+        }
+
+        # Add pipeline-review to sample_config
+        config = dict(sample_config)
+        config["healthcheck"] = dict(config["healthcheck"])
+        config["healthcheck"]["expected_intervals"] = dict(config["healthcheck"]["expected_intervals"])
+        config["healthcheck"]["expected_intervals"]["pipeline-review"] = 180
+        config["tasks"] = dict(config["tasks"])
+        config["tasks"]["pipeline-review"] = {
+            "name": "Weekly Pipeline Review",
+            "command": "/opt/homebrew/bin/claude",
+            "schedule": "weekly mon 7:44",
+        }
+
+        with patch("lib.heartbeat._load_state", return_value=mock_state), \
+             patch("lib.heartbeat._is_ignored", return_value=False), \
+             patch("lib.heartbeat._send_missed_task_notification"), \
+             patch("lib.heartbeat._send_slack_message"), \
+             patch("lib.heartbeat._load_heartbeat_alert_state", return_value={}), \
+             patch("lib.heartbeat._save_heartbeat_alert_state"), \
+             patch("lib.heartbeat.detect_disabled_agents", return_value=[]), \
+             patch("lib.heartbeat._load_monitoring_down_state", return_value={}), \
+             patch("lib.heartbeat._save_monitoring_down_state"), \
+             patch("lib.heartbeat.detect_stale_triggers", return_value=stale_tasks), \
+             patch("lib.heartbeat.recover_stale_trigger") as mock_recover, \
+             patch("lib.heartbeat._load_task_diagnosis_state", return_value=task_diag_state), \
+             patch("lib.heartbeat._save_task_diagnosis_state"), \
+             patch("lib.heartbeat._attempt_task_diagnosis", return_value=False):
+            from lib.heartbeat import run_heartbeat
+
+            result = run_heartbeat(config, wake_delay=0)
+
+            # Recovery should NOT have been called — cooldown active
+            mock_recover.assert_not_called()
+            assert result.get("stale_triggers_recovered", 0) == 0

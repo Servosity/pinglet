@@ -259,6 +259,51 @@ def detect_disabled_agents(config: dict) -> List[Dict]:
     return disabled
 
 
+def _should_recover_stale_trigger(task_id: str, task_diagnosis_state: dict,
+                                    expected_interval: float) -> bool:
+    """Check if stale trigger recovery should be attempted for a task.
+
+    After a stale trigger recovery, applies a cooldown equal to the task's
+    expected_interval before attempting another recovery. This prevents
+    infinite re-bootstrap loops for long-interval tasks (e.g., weekly)
+    where runs=0 is normal between scheduled fire times.
+
+    Args:
+        task_id: Task identifier
+        task_diagnosis_state: Per-task diagnosis tracking state
+        expected_interval: Task's expected interval in hours (from healthcheck config)
+
+    Returns:
+        True if recovery should be attempted
+    """
+    entry = task_diagnosis_state.get(task_id, {})
+    last_recovery = entry.get("last_stale_recovery")
+
+    if not last_recovery:
+        return True
+
+    try:
+        last_dt = datetime.fromisoformat(last_recovery)
+        hours_since = (datetime.now() - last_dt).total_seconds() / 3600
+        # Cooldown = expected_interval, minimum 2 hours
+        cooldown = max(expected_interval, 2.0)
+        return hours_since >= cooldown
+    except (ValueError, TypeError):
+        return True
+
+
+def _record_stale_recovery(task_id: str, task_diagnosis_state: dict) -> None:
+    """Record that a stale trigger recovery was attempted for a task.
+
+    Args:
+        task_id: Task identifier
+        task_diagnosis_state: Per-task diagnosis tracking state (modified in-place)
+    """
+    if task_id not in task_diagnosis_state:
+        task_diagnosis_state[task_id] = {}
+    task_diagnosis_state[task_id]["last_stale_recovery"] = datetime.now().isoformat()
+
+
 def detect_stale_triggers(missed_tasks: List[Dict]) -> List[Dict]:
     """Detect missed tasks caused by stale launchd calendar triggers.
 
@@ -1341,12 +1386,21 @@ def run_heartbeat(config: dict, wake_delay: Optional[int] = None) -> dict:
         log(f"Found {len(missed_tasks)} missed task(s)", "heartbeat")
 
         # Tier 1: Stale trigger recovery (bounce launchd)
+        # Apply cooldown: don't re-recover the same task within its expected_interval.
+        # This prevents infinite re-bootstrap loops for long-interval tasks (e.g., weekly)
+        # where runs=0 is normal between scheduled fire times.
+        expected_intervals = config.get("healthcheck", {}).get("expected_intervals", {})
         stale = detect_stale_triggers(missed_tasks)
         for task in stale:
             task_name = task["task_name"]
+            interval = expected_intervals.get(task_name, 24)
+            if not _should_recover_stale_trigger(task_name, task_diagnosis_state, interval):
+                log(f"Skipping stale recovery for {task_name} (cooldown active, interval={interval}h)", "heartbeat")
+                continue
             result = recover_stale_trigger(task_name)
             if result == "recovered":
                 stale_triggers_recovered += 1
+                _record_stale_recovery(task_name, task_diagnosis_state)
                 log(f"Recovered stale trigger for {task_name}", "heartbeat")
 
         # Tier 2: Task-level LLM diagnosis for persistently missed tasks
