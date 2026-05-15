@@ -28,6 +28,7 @@ class ReliabilityConfig:
     # Alert gating settings
     alert_threshold: int = 3  # Consecutive failures before alerting
     alert_cooldown_minutes: int = 30  # Minimum time between alerts
+    alert_grace_minutes: int = 15  # Wall-clock minutes a streak must persist before alerting
 
     # Recovery notification
     notify_on_recovery: bool = True
@@ -66,6 +67,8 @@ class ReliabilityConfig:
                 config.alert_threshold = alert["consecutive_failures"]
             if "cooldown_minutes" in alert:
                 config.alert_cooldown_minutes = alert["cooldown_minutes"]
+            if "grace_minutes" in alert:
+                config.alert_grace_minutes = alert["grace_minutes"]
 
             if "notify_on_recovery" in global_config:
                 config.notify_on_recovery = global_config["notify_on_recovery"]
@@ -85,6 +88,8 @@ class ReliabilityConfig:
                 config.alert_threshold = alert["consecutive_failures"]
             if "cooldown_minutes" in alert:
                 config.alert_cooldown_minutes = alert["cooldown_minutes"]
+            if "grace_minutes" in alert:
+                config.alert_grace_minutes = alert["grace_minutes"]
 
             if "notify_on_recovery" in task_config:
                 config.notify_on_recovery = task_config["notify_on_recovery"]
@@ -171,6 +176,18 @@ class ReliabilityManager:
         if self.state.consecutive_failures < self.config.alert_threshold:
             return False, f"below_threshold ({self.state.consecutive_failures}/{self.config.alert_threshold})"
 
+        # Check wall-clock grace period — suppresses noise from brief blips that
+        # rack up consecutive failures in seconds (e.g. minute-cadence tasks).
+        if self.config.alert_grace_minutes > 0 and self.state.first_failure_at:
+            try:
+                first_fail = datetime.fromisoformat(self.state.first_failure_at)
+                grace_end = first_fail + timedelta(minutes=self.config.alert_grace_minutes)
+                if datetime.now() < grace_end:
+                    remaining = (grace_end - datetime.now()).total_seconds() / 60
+                    return False, f"grace_period_active ({remaining:.1f}m remaining)"
+            except ValueError:
+                pass  # Invalid timestamp, allow alert
+
         # Check cooldown
         if self.state.last_alert_time:
             try:
@@ -200,9 +217,16 @@ class ReliabilityManager:
         Returns:
             True if task recovered from failures
         """
-        # Reload state to check was_failing flag
+        # Reload state to check was_failing flag. Only treat this as a recovery
+        # if a failure alert was actually sent during the streak — otherwise the
+        # streak was silent (suppressed by grace/threshold) and recovery would
+        # be noise without a corresponding failure message.
         self.state = load_state(self.task_name)
-        return self.state.was_failing and self.config.notify_on_recovery
+        return (
+            self.state.was_failing
+            and self.state.alerted_during_streak
+            and self.config.notify_on_recovery
+        )
 
     def get_previous_failures(self) -> int:
         """Get the number of consecutive failures before this run."""

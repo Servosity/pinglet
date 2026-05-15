@@ -33,6 +33,8 @@ class TaskState:
     last_alert_time: Optional[str] = None  # ISO timestamp of last alert sent
     alerts_sent_this_streak: int = 0  # Alerts sent for current failure streak
     was_failing: bool = False  # True if previous run failed (for recovery detection)
+    first_failure_at: Optional[str] = None  # ISO timestamp when current failure streak began
+    alerted_during_streak: bool = False  # True iff send_critical fired during the most recent streak
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -46,6 +48,8 @@ class TaskState:
             "last_alert_time": None,
             "alerts_sent_this_streak": 0,
             "was_failing": data.get("consecutive_failures", 0) > 0,  # Infer from existing
+            "first_failure_at": None,
+            "alerted_during_streak": False,
         }
         for key, default in defaults.items():
             if key not in data:
@@ -135,9 +139,12 @@ def update_state_success(task_name: str, duration: float) -> TaskState:
         state.runs_today = 1
         state.runs_today_date = today
 
-    # Reset alert tracking on success
+    # Reset alert tracking on success. Capture whether the streak ever alerted
+    # BEFORE zeroing the counter so is_recovery() can read it after this call.
+    state.alerted_during_streak = state.alerts_sent_this_streak > 0
     state.alerts_sent_this_streak = 0
     state.was_failing = was_previously_failing  # Store for recovery check
+    state.first_failure_at = None
 
     save_state(state)
     return state
@@ -158,6 +165,12 @@ def update_state_failure(task_name: str, error: str, duration: float, timeout: b
     """
     state = load_state(task_name)
     today = datetime.now().strftime("%Y-%m-%d")
+
+    # First failure of a new streak: stamp the streak start and clear the
+    # prior streak's alerted flag so it can't leak into this streak's recovery decision.
+    if state.consecutive_failures == 0:
+        state.first_failure_at = datetime.now().isoformat()
+        state.alerted_during_streak = False
 
     state.last_run = datetime.now().isoformat()
     state.last_status = "timeout" if timeout else "failed"
