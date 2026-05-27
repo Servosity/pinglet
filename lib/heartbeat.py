@@ -299,9 +299,9 @@ def _record_stale_recovery(task_id: str, task_diagnosis_state: dict) -> None:
         task_id: Task identifier
         task_diagnosis_state: Per-task diagnosis tracking state (modified in-place)
     """
-    if task_id not in task_diagnosis_state:
-        task_diagnosis_state[task_id] = {}
-    task_diagnosis_state[task_id]["last_stale_recovery"] = datetime.now().isoformat()
+    now = datetime.now().isoformat()
+    task_diagnosis_state.setdefault(task_id, _new_diagnosis_entry(now, "stale_recovery"))
+    task_diagnosis_state[task_id]["last_stale_recovery"] = now
 
 
 def detect_stale_triggers(missed_tasks: List[Dict]) -> List[Dict]:
@@ -680,6 +680,27 @@ def _save_task_diagnosis_state(state: dict) -> None:
         json.dump(state, f, indent=2)
 
 
+def _new_diagnosis_entry(now: str, problem: str = "") -> dict:
+    """Canonical shape for a per-task diagnosis state entry.
+
+    Any code path that creates a new entry in _task_diagnosis.json must use
+    this — partial init has crashed run_heartbeat in the past when a later
+    function indexed a key that was never set.
+    """
+    return {
+        "consecutive_detections": 0,
+        "first_detected": now,
+        "last_detected": now,
+        "detected_problem": problem,
+        "diagnosis_attempted": False,
+        "last_diagnosis": None,
+        "recovery_attempts": 0,
+        "fixed_at": None,
+        "recurring_fix_failures": 0,
+        "last_fix_summary": "",
+    }
+
+
 def _record_task_detection(task_id: str, state: dict, problem: str) -> dict:
     """Record a heartbeat detection of a task anomaly (stale/disabled/stuck).
 
@@ -687,20 +708,9 @@ def _record_task_detection(task_id: str, state: dict, problem: str) -> dict:
     increments recurring_fix_failures to track that the fix didn't stick.
     """
     now = datetime.now().isoformat()
-    if task_id not in state:
-        state[task_id] = {
-            "consecutive_detections": 0,
-            "first_detected": now,
-            "last_detected": now,
-            "detected_problem": problem,
-            "diagnosis_attempted": False,
-            "last_diagnosis": None,
-            "recovery_attempts": 0,
-            "fixed_at": None,
-            "recurring_fix_failures": 0,
-            "last_fix_summary": "",
-        }
-    entry = state[task_id]
+    entry = state.setdefault(task_id, _new_diagnosis_entry(now, problem))
+    for k, v in _new_diagnosis_entry(now, problem).items():
+        entry.setdefault(k, v)
 
     # Check if this is a recurrence after a "fix"
     fixed_at = entry.get("fixed_at")

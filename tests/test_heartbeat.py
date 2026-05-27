@@ -695,6 +695,7 @@ class TestMonitoringDownThreshold:
              patch("lib.heartbeat._is_ignored", return_value=False), \
              patch("lib.heartbeat.detect_disabled_agents", return_value=disabled_agents), \
              patch("lib.heartbeat._attempt_auto_recovery", return_value=False), \
+             patch("lib.heartbeat._attempt_llm_self_diagnosis", return_value=False), \
              patch("lib.heartbeat._load_monitoring_down_state", return_value=monitoring_down), \
              patch("lib.heartbeat._save_monitoring_down_state") as mock_save, \
              patch("lib.heartbeat._should_send_disabled_agent_alert", return_value=False), \
@@ -750,7 +751,7 @@ class TestMonitoringDownThreshold:
 
     # --- LLM self-diagnosis tests (tests 11-13) ---
 
-    def test_llm_diagnosis_invoked_after_recovery_fails(self):
+    def test_llm_diagnosis_invoked_after_recovery_fails(self, tmp_path):
         """After auto-recovery fails once, 2nd detection should invoke LLM diagnosis."""
         from lib.heartbeat import (
             _record_monitoring_detection,
@@ -777,14 +778,15 @@ class TestMonitoringDownThreshold:
         mock_status = {"installed": True, "running": False, "exit_code": 78,
                        "disabled": True, "status": "disabled"}
 
-        with patch("lib.heartbeat.subprocess") as mock_subprocess:
+        with patch("lib.heartbeat.PROJECT_ROOT", tmp_path), \
+             patch("lib.heartbeat.subprocess") as mock_subprocess:
             mock_subprocess.run.return_value = MagicMock(returncode=0, stdout="Fixed it")
             result = _attempt_llm_self_diagnosis("healthcheck", mock_status)
 
         # Just verify it was called (the function exists and accepts these args)
         assert isinstance(result, bool)
 
-    def test_llm_diagnosis_success_resets_state(self):
+    def test_llm_diagnosis_success_resets_state(self, tmp_path):
         """Successful LLM diagnosis should clear the monitoring-down state."""
         from lib.heartbeat import (
             _attempt_llm_self_diagnosis,
@@ -805,7 +807,8 @@ class TestMonitoringDownThreshold:
         mock_status = {"installed": True, "running": False, "exit_code": 78,
                        "disabled": True, "status": "disabled"}
 
-        with patch("lib.heartbeat.subprocess") as mock_subprocess:
+        with patch("lib.heartbeat.PROJECT_ROOT", tmp_path), \
+             patch("lib.heartbeat.subprocess") as mock_subprocess:
             mock_subprocess.run.return_value = MagicMock(returncode=0, stdout="Fixed it")
             diagnosis_result = _attempt_llm_self_diagnosis("healthcheck", mock_status)
 
@@ -817,7 +820,7 @@ class TestMonitoringDownThreshold:
                 assert state["healthcheck"]["consecutive_detections"] == 0
             # Agent removed entirely is also acceptable
 
-    def test_llm_diagnosis_failure_increments(self):
+    def test_llm_diagnosis_failure_increments(self, tmp_path):
         """Failed LLM diagnosis should still allow counter to increment."""
         from lib.heartbeat import (
             _record_monitoring_detection,
@@ -838,7 +841,8 @@ class TestMonitoringDownThreshold:
         mock_status = {"installed": True, "running": False, "exit_code": 78,
                        "disabled": True, "status": "disabled"}
 
-        with patch("lib.heartbeat.subprocess") as mock_subprocess:
+        with patch("lib.heartbeat.PROJECT_ROOT", tmp_path), \
+             patch("lib.heartbeat.subprocess") as mock_subprocess:
             mock_subprocess.run.return_value = MagicMock(returncode=1, stdout="Could not diagnose")
             diagnosis_result = _attempt_llm_self_diagnosis("healthcheck", mock_status)
 
@@ -1246,6 +1250,38 @@ class TestStaleRecoveryCooldown:
         # Timestamp should be recent (within 5 seconds)
         ts = datetime.fromisoformat(state["pipeline-review"]["last_stale_recovery"])
         assert (datetime.now() - ts).total_seconds() < 5
+
+    def test_stale_recovery_then_detection_no_keyerror(self):
+        """Regression: _record_stale_recovery + _record_task_detection on a new
+        task must not raise KeyError.
+
+        This crash-looped heartbeat 689 times between 2026-05-15 and 2026-05-27.
+        _record_stale_recovery used to init a bare {} entry, then
+        _record_task_detection tried to increment "consecutive_detections" on it.
+        """
+        from lib.heartbeat import _record_stale_recovery, _record_task_detection
+
+        state = {}
+        _record_stale_recovery("brand-new-task", state)
+        # Must not raise — the partial entry must be self-healed.
+        state = _record_task_detection("brand-new-task", state, "stale (2h overdue)")
+        assert state["brand-new-task"]["consecutive_detections"] == 1
+        assert state["brand-new-task"]["recovery_attempts"] == 1
+        assert state["brand-new-task"]["detected_problem"] == "stale (2h overdue)"
+        # Stale-recovery timestamp must be preserved through detection.
+        assert "last_stale_recovery" in state["brand-new-task"]
+
+    def test_record_task_detection_heals_partial_entry(self):
+        """_record_task_detection must merge in missing schema keys, not crash."""
+        from lib.heartbeat import _record_task_detection
+
+        # Simulate a legacy/partial entry written by an earlier code path.
+        state = {"legacy-task": {"last_stale_recovery": "2026-01-01T00:00:00"}}
+        state = _record_task_detection("legacy-task", state, "disabled (exit 78)")
+        assert state["legacy-task"]["consecutive_detections"] == 1
+        assert state["legacy-task"]["recovery_attempts"] == 1
+        # Pre-existing keys are preserved.
+        assert state["legacy-task"]["last_stale_recovery"] == "2026-01-01T00:00:00"
 
     def test_heartbeat_skips_stale_recovery_when_cooldown_active(self, sample_config):
         """run_heartbeat should NOT re-recover stale triggers within cooldown.

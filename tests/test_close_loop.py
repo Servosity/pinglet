@@ -444,7 +444,7 @@ class TestSelfDiagnosis:
             # Then LLM diagnosis should be attempted after auto-recovery fails
             mock_llm.assert_called_once_with("heartbeat", agent_info)
 
-    def test_self_diagnosis_success_resets_state(self):
+    def test_self_diagnosis_success_resets_state(self, tmp_path):
         """LLM returns exit 0 + agent healthy -> returns True."""
         agent_id = "heartbeat"
         status = {
@@ -467,7 +467,8 @@ class TestSelfDiagnosis:
             "status": "idle",
         }
 
-        with patch("subprocess.run", return_value=mock_proc) as mock_run, \
+        with patch("lib.heartbeat.PROJECT_ROOT", tmp_path), \
+             patch("subprocess.run", return_value=mock_proc) as mock_run, \
              patch("lib.heartbeat._get_launchd_status", return_value=healthy_status), \
              patch("lib.heartbeat.log"):
             from lib.heartbeat import _attempt_llm_self_diagnosis
