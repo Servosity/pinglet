@@ -823,17 +823,32 @@ def _get_uid() -> str:
 def _strip_macl_from_logs(task_id: str) -> None:
     """Strip com.apple.macl xattr from task log files.
 
-    macOS Sequoia adds Managed Access Control Lists to files, which can
-    prevent launchd from writing to stdout/stderr paths (causing exit 78).
-    Removing the xattr before bootstrap ensures launchd can open the files.
+    macOS Sequoia adds Managed Access Control Lists to launchd-managed
+    stdout/stderr files. Once a MACL evolves into a blocking state, launchd
+    can't write to the file and the agent exits 78 (EX_CONFIG) in a crash
+    loop. Auto-recovery isn't enough unless the file is reset.
+
+    `xattr -d com.apple.macl` returns exit 0 but does NOT remove the attribute
+    (it's kernel-protected). The only reliable reset is to delete the file
+    and recreate it empty; launchd opens the fresh file on next bootstrap.
+
+    Covers both regular task logs ({task_id}.log/.err) and monitoring agent
+    logs (launchd-{task_id}.log), since heartbeat and healthcheck use the
+    launchd- prefix.
     """
-    for suffix in (".log", ".err"):
-        log_path = LOGS_DIR / f"{task_id}{suffix}"
-        if log_path.exists():
-            subprocess.run(
-                ["xattr", "-d", "com.apple.macl", str(log_path)],
-                capture_output=True,
-            )
+    candidates = [
+        LOGS_DIR / f"{task_id}.log",
+        LOGS_DIR / f"{task_id}.err",
+        LOGS_DIR / f"launchd-{task_id}.log",
+    ]
+    for log_path in candidates:
+        if not log_path.exists():
+            continue
+        try:
+            log_path.unlink()
+            log_path.touch()
+        except OSError:
+            pass
 
 
 def _write_and_install_plist(task_id: str, schedule_dict: dict) -> Path:

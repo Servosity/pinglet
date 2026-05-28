@@ -504,6 +504,11 @@ def install_heartbeat() -> int:
         capture_output=True,
     )
 
+    # Strip MACL xattrs from heartbeat log to prevent launchd exit 78
+    # (macOS Sequoia adds com.apple.macl, which blocks launchd writes)
+    from lib.task_manager import _strip_macl_from_logs
+    _strip_macl_from_logs("heartbeat")
+
     # Load the agent
     result = subprocess.run(
         ["launchctl", "load", str(target_path)],
