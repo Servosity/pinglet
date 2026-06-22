@@ -70,3 +70,29 @@ tasks:
     reliability:
       alert:
         consecutive_failures: 2
+
+  # Example task with on_failure LLM auto-diagnosis
+  # When the task fails the alert threshold, Pinglet invokes `claude -p` with
+  # the prompt below. The callback should fix the root cause and exit 0, or
+  # exit 1 to escalate to a human. Without on_failure, alerts show
+  # "LLM Troubleshooter: Not configured — human intervention required".
+  #
+  # Template variables: {task_id}, {task_name}, {exit_code}, {error},
+  # {log_file}, {stderr_file}, {stdout_file}, {working_dir},
+  # {consecutive_failures}, {state_file}, {project_root}, {learning_file}
+  self-healing-task:
+    name: Self-Healing Example
+    command: /path/to/venv/bin/python
+    args:
+      - script.py
+    working_dir: /path/to/project
+    timeout: 300
+    schedule: every 1h
+    on_failure:
+      command: claude
+      args:
+        - "-p"
+        - "Task {task_id} failed (exit {exit_code}). Read {stderr_file} and {log_file}. Check {learning_file} for prior diagnoses of this task. Investigate the working directory {working_dir} for the root cause. Fix it if possible. Exit 0 if fixed, exit 1 if human intervention is needed."
+      timeout: 180             # Wall-clock budget for the callback
+      max_turns: 5             # Cap claude -p iterations
+      max_budget_usd: 2.00     # Cap spend per invocation
