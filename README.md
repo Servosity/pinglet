@@ -221,7 +221,16 @@ The heartbeat tracks failure patterns per task in `state/_learning.json` and ada
 
 ### `on_failure` Callback
 
-When a task fails, Pinglet can invoke an external command (typically an LLM) to diagnose and fix the issue before alerting a human.
+When a task fails the alert threshold, Pinglet can invoke an external command (typically `claude -p`) to diagnose and fix the root cause before alerting a human.
+
+**Without `on_failure`**, failure alerts on Slack include:
+
+> *LLM Troubleshooter: Not configured — human intervention required*
+
+**With `on_failure`**, the same alert reports the callback outcome:
+
+> *LLM Troubleshooter: Invoked ✓ (exit 0 — may be fixed, verify next run)*
+> *LLM Troubleshooter: Invoked ✗ (exit 1 — human intervention required)*
 
 **Config (config.yaml):**
 
@@ -267,6 +276,10 @@ $P --task-add my-task --command ./run.py \
 | `{learning_file}` | Path to `state/_learning.json` |
 
 **Exit code contract:** The callback should exit `0` if it fixed the problem (Pinglet will retry the task), or `1` if human intervention is needed (Pinglet proceeds to alert).
+
+**Sibling: `on_diagnose`** — fires when the **heartbeat** detects a task is stale or its LaunchAgent is disabled (not when the task itself exited non-zero). Same schema, same template variables. If omitted, heartbeat uses a built-in default prompt. Use this to customize how the LLM recovers from missed-run / disabled-agent states.
+
+**Gotcha — Claude Code hooks block the callback:** If you use `claude -p` as the callback and have a `PreToolUse:Bash` hook in `~/.claude/settings.json` that references a per-project path (e.g. `${CLAUDE_PROJECT_DIR}/.claude/hooks/foo.py`), the hook will fail in any project that doesn't have that file, blocking every `Bash` call the LLM tries. The callback exits 0 (the CLI succeeded; the *tools* were denied), so Pinglet thinks it worked. Use absolute paths (`$HOME/.claude/hooks/foo.py`) in Bash hooks.
 
 ### `--status` API
 
