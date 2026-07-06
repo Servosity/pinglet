@@ -36,14 +36,37 @@ healthcheck:
   expected_intervals:               # Hours - alert if task hasn't run
     my-task: 2                      # Example: alert if not run within 2 hours
 
+agent_runners:
+  # Slot order is fixed: primary, secondary, tertiary.
+  # Fallback happens after 3 consecutive provider failures for the same callback.
+  primary:
+    provider: codex
+    subscription: openai
+    model: gpt-5.5
+    command: codex
+  secondary:
+    provider: claude
+    subscription: claude
+    model: sonnet-4.6
+    fallback_model: sonnet-5
+    command: claude
+  tertiary:
+    enabled: false
+    provider: openrouter
+    subscription: openrouter
+    model: qwen/qwen3-coder
+    api_key_env: OPENROUTER_API_KEY
+
 # Task definitions
 # Each task needs: command, working_dir, and optionally args, timeout, env, output, reliability
 tasks:
   # Example task with basic configuration
   my-task:
     name: My Task Name              # Display name for notifications
-    command: /path/to/venv/bin/python
+    command: uv
     args:
+      - run
+      - python
       - script.py
       - --flag
     working_dir: /path/to/project
@@ -59,8 +82,10 @@ tasks:
   # Example task with JSON output formatting
   json-output-task:
     name: JSON Output Example
-    command: /path/to/venv/bin/python
+    command: uv
     args:
+      - run
+      - python
       - script.py
     working_dir: /path/to/project
     timeout: 300
@@ -72,8 +97,8 @@ tasks:
         consecutive_failures: 2
 
   # Example task with on_failure LLM auto-diagnosis
-  # When the task fails the alert threshold, Pinglet invokes `claude -p` with
-  # the prompt below. The callback should fix the root cause and exit 0, or
+  # When the task fails the alert threshold, Pinglet invokes the configured
+  # CLI runner. The callback should fix the root cause and exit 0, or
   # exit 1 to escalate to a human. Without on_failure, alerts show
   # "LLM Troubleshooter: Not configured — human intervention required".
   #
@@ -82,17 +107,19 @@ tasks:
   # {consecutive_failures}, {state_file}, {project_root}, {learning_file}
   self-healing-task:
     name: Self-Healing Example
-    command: /path/to/venv/bin/python
+    command: uv
     args:
+      - run
+      - python
       - script.py
     working_dir: /path/to/project
     timeout: 300
     schedule: every 1h
     on_failure:
-      command: claude
+      command: codex
       args:
         - "-p"
         - "Task {task_id} failed (exit {exit_code}). Read {stderr_file} and {log_file}. Check {learning_file} for prior diagnoses of this task. Investigate the working directory {working_dir} for the root cause. Fix it if possible. Exit 0 if fixed, exit 1 if human intervention is needed."
       timeout: 180             # Wall-clock budget for the callback
-      max_turns: 5             # Cap claude -p iterations
+      max_turns: 5             # Cap CLI agent turns
       max_budget_usd: 2.00     # Cap spend per invocation

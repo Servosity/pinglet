@@ -1,0 +1,19 @@
+[project]
+name = "pinglet"
+version = "0.1.0"
+description = "Universal task wrapper for macOS with logging, state, and alerts."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "PyYAML",
+    "python-dotenv",
+    "slack-sdk",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+]
+
+[tool.uv]
+package = false

@@ -17,7 +17,9 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/YOUR_USERNAME/path/to/pinglet/venv/bin/python</string>
+        <string>uv</string>
+        <string>run</string>
+        <string>python</string>
         <string>/Users/YOUR_USERNAME/path/to/pinglet/pinglet.py</string>
         <string>--task</string>
         <string>TASK_NAME</string>

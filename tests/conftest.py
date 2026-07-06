@@ -164,3 +164,9 @@ def isolate_logs(tmp_path_factory):
     test_logs = tmp_path_factory.mktemp("isolated_logs")
     with patch("lib.logging.LOGS_DIR", test_logs):
         yield test_logs
+
+
+@pytest.fixture(autouse=True)
+def isolate_agent_runner_state(tmp_path, monkeypatch):
+    """Redirect provider fallback state away from the real repo."""
+    monkeypatch.setattr("lib.agent_runners.STATE_FILE", tmp_path / "_agent_runners.json")

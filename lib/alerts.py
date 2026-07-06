@@ -172,9 +172,9 @@ def send_critical(task_name: str, error: str, details: dict = None, log_file: st
     # Add actionable commands
     slack_message += f"""
 *Actions:*
-\u2022 Retry now: `cd {PROJECT_ROOT} && ./venv/bin/python pinglet.py --task {task_id or 'TASK_NAME'}`
+\u2022 Retry now: `cd {PROJECT_ROOT} && uv run python pinglet.py --task {task_id or 'TASK_NAME'}`
 \u2022 View logs: `tail -100 {log_file or f'{PROJECT_ROOT}/logs/pinglet.log'}`
-\u2022 Check all tasks: `./venv/bin/python pinglet.py --status`
+\u2022 Check all tasks: `uv run python pinglet.py --status`
 """
 
     # Send to Slack
@@ -297,8 +297,8 @@ def send_health_summary(tasks: list, healthy: bool = True) -> None:
     if not healthy:
         slack_message += f"""
 *Actions:*
-• Check status: `cd {PROJECT_ROOT} && ./venv/bin/python pinglet.py --list`
-• Run manually: `./venv/bin/python pinglet.py --task <task_name>`
+• Check status: `cd {PROJECT_ROOT} && uv run python pinglet.py --list`
+• Run manually: `uv run python pinglet.py --task <task_name>`
 • View logs: `tail -50 {log_file}`
 """
 
@@ -320,115 +320,16 @@ def send_health_summary(tasks: list, healthy: bool = True) -> None:
         )
 
 
-def send_missed_task_notification(
-    task_name: str,
-    display_name: str,
-    hours_overdue: float,
-    threshold: int
-) -> bool:
-    """
-    Send macOS notification with Run/Ignore actions for a missed task.
-
-    Args:
-        task_name: Task identifier for commands
-        display_name: Human-readable task name
-        hours_overdue: Hours past threshold
-        threshold: Expected interval in hours
-
-    Returns:
-        True on success, False on failure
-    """
-    pinglet_path = PROJECT_ROOT / "venv" / "bin" / "python"
-    pinglet_script = PROJECT_ROOT / "pinglet.py"
-
-    # Build commands that open Terminal and execute
-    run_command = f'open -a Terminal "{pinglet_path} {pinglet_script} --run-now {task_name}"'
-    ignore_command = f'open -a Terminal "{pinglet_path} {pinglet_script} --ignore {task_name}"'
-
-    total_hours = hours_overdue + threshold
-    message = f"{display_name} last ran {total_hours:.1f}h ago (threshold: {threshold}h)"
-
-    try:
-        # Try terminal-notifier with actions
-        cmd = [
-            "terminal-notifier",
-            "-title", "Pinglet: Missed Task",
-            "-message", message,
-            "-actions", "Run,Ignore",
-            "-execute", run_command,
-            "-sound", "default",
-            "-timeout", "0",  # Don't auto-dismiss
-        ]
-
-        # Add custom app icon if it exists
-        if NOTIFICATION_ICON.exists():
-            cmd.extend(["-appIcon", str(NOTIFICATION_ICON)])
-
-        result = subprocess.run(cmd, capture_output=True, timeout=5)
-
-        if result.returncode == 0:
-            print(f"ALERT | Missed task notification sent for {task_name}")
-            return True
-
-        # Fallback to AppleScript dialog with buttons
-        print(f"ALERT | terminal-notifier failed, trying AppleScript dialog")
-        return _send_missed_task_dialog(task_name, display_name, hours_overdue, threshold)
-
-    except FileNotFoundError:
-        print("ALERT | terminal-notifier not available, trying AppleScript")
-        return _send_missed_task_dialog(task_name, display_name, hours_overdue, threshold)
-    except Exception as e:
-        print(f"ALERT | Missed task notification error: {e}")
-        return False
 
 
-def _send_missed_task_dialog(
-    task_name: str,
-    display_name: str,
-    hours_overdue: float,
-    threshold: int
-) -> bool:
-    """
-    Send AppleScript dialog with Run/Ignore buttons as fallback.
+def send_missed_task_notification(task_name: str, display_name: str, hours_overdue: float, threshold: int) -> bool:
+    from lib.alert_missed import send_missed_task_notification as _impl
+    return _impl(task_name, display_name, hours_overdue, threshold)
 
-    Args:
-        task_name: Task identifier for commands
-        display_name: Human-readable task name
-        hours_overdue: Hours past threshold
-        threshold: Expected interval in hours
 
-    Returns:
-        True on success, False on failure
-    """
-    pinglet_path = PROJECT_ROOT / "venv" / "bin" / "python"
-    pinglet_script = PROJECT_ROOT / "pinglet.py"
-
-    total_hours = hours_overdue + threshold
-
-    script = f'''
-    set dialogResult to display dialog "Task '{display_name}' hasn't run in {total_hours:.1f} hours (threshold: {threshold}h)." ¬
-        buttons {{"Ignore", "Run Now"}} default button "Run Now" ¬
-        with title "Pinglet: Missed Task" ¬
-        giving up after 300
-
-    if button returned of dialogResult is "Run Now" then
-        do shell script "open -a Terminal \\"{pinglet_path} {pinglet_script} --run-now {task_name}\\""
-    else if button returned of dialogResult is "Ignore" then
-        do shell script "open -a Terminal \\"{pinglet_path} {pinglet_script} --ignore {task_name}\\""
-    end if
-    '''
-
-    try:
-        result = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True,
-            timeout=310,  # Slightly longer than dialog timeout
-        )
-        return result.returncode == 0
-    except Exception as e:
-        print(f"ALERT | AppleScript dialog error: {e}")
-        return False
-
+def _send_missed_task_dialog(task_name: str, display_name: str, hours_overdue: float, threshold: int) -> bool:
+    from lib.alert_missed import _send_missed_task_dialog as _impl
+    return _impl(task_name, display_name, hours_overdue, threshold)
 
 def send_missed_task_slack(
     task_name: str,
@@ -553,69 +454,11 @@ def send_manual_complete_notification(
         return False
 
 
+
+
 def send_critical_monitoring_alert(disabled_agents: list, llm_result: dict = None) -> bool:
-    """Send urgent Slack alert when monitoring agents themselves are dead.
-
-    This is a distinct, high-priority alert separate from regular task failures.
-    Includes fix commands, auto-recovery status, and LLM diagnosis results.
-
-    Args:
-        disabled_agents: List of dicts with keys: task_id, label, exit_code, status
-        llm_result: Optional dict with keys: attempted, success, log_file
-
-    Returns:
-        True if alert sent successfully
-    """
-    if not disabled_agents:
-        return True
-
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    agent_lines = []
-    fix_lines = []
-    for agent in disabled_agents:
-        agent_lines.append(f"\u2022 `{agent['task_id']}` \u2014 {agent['status']} (exit {agent['exit_code']})")
-        fix_lines.append(f"  ./venv/bin/python pinglet.py --task-enable {agent['task_id']}")
-
-    slack_message = f"""*Pinglet: MONITORING DOWN*
-
-*Timestamp:* {timestamp}
-*Status:* CRITICAL \u2014 monitoring agents are dead
-
-*Disabled agents:*
-{chr(10).join(agent_lines)}
-"""
-
-    # LLM diagnosis status
-    if llm_result and llm_result.get("attempted"):
-        if llm_result.get("success"):
-            slack_message += "*LLM Self-Diagnosis:* Invoked \u2713 (exit 0 \u2014 may be fixed, verify next cycle)\n"
-        else:
-            slack_message += "*LLM Self-Diagnosis:* Invoked \u2717 (failed \u2014 human intervention required)\n"
-            if llm_result.get("log_file"):
-                slack_message += f"  Output: `{llm_result['log_file']}`\n"
-    else:
-        slack_message += "*LLM Self-Diagnosis:* Auto-recovery + LLM both failed\n"
-
-    slack_message += f"""
-*Fix (run from {PROJECT_ROOT}):*
-```
-{chr(10).join(fix_lines)}
-```
-
-_This means task failures may go undetected until agents are re-enabled._
-_System status: `./venv/bin/python pinglet.py --status`_"""
-
-    result = send_slack_message(slack_message)
-
-    # Also send macOS notification
-    agent_names = ", ".join(a["task_id"] for a in disabled_agents[:3])
-    send_macos_notification(
-        "Pinglet: MONITORING DOWN",
-        f"Disabled agents: {agent_names}\nTask failures may go undetected!",
-    )
-
-    return result
-
+    from lib.alert_monitoring import send_critical_monitoring_alert as _impl
+    return _impl(disabled_agents, llm_result)
 
 def test_alerts() -> dict:
     """

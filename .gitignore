@@ -1,5 +1,6 @@
 # Python
 venv/
+.venv/
 __pycache__/
 *.pyc
 *.pyo
@@ -31,8 +32,13 @@ launchagents/*.plist
 PLAN.md
 Spec.md
 
-# Claude Code local settings
-.claude/
+# Agent/CLI local settings
+.codex/
+.claude/*
+!.claude/skills/
+!.claude/skills/**
+.claude/settings*.json
+.claude/**/settings*.json
 
 # Git backup (from history rewrites)
 .git-backup/

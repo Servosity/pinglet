@@ -23,21 +23,21 @@ Run from repo root. All commands output JSON — parse the `ok` field.
 bash scripts/install-hooks.sh
 
 # Full CLI reference
-./venv/bin/python ./pinglet.py --help
+uv run python pinglet.py --help
 
 # List all pinglets
-./venv/bin/python ./pinglet.py --list --json
+uv run python pinglet.py --list --json
 
 # Full details + state + logs for one pinglet
-./venv/bin/python ./pinglet.py --task-show <id>
+uv run python pinglet.py --task-show <id>
 
 # Add + enable a pinglet
-./venv/bin/python ./pinglet.py --task-add my-task --command /usr/bin/python3 --args script.py --schedule-spec "daily 7:00"
-./venv/bin/python ./pinglet.py --task-enable my-task
+uv run python pinglet.py --task-add my-task --command /usr/bin/python3 --args script.py --schedule-spec "daily 7:00"
+uv run python pinglet.py --task-enable my-task
 
 # Run health check / heartbeat
-./venv/bin/python ./pinglet.py --healthcheck
-./venv/bin/python ./pinglet.py --heartbeat
+uv run python pinglet.py --healthcheck
+uv run python pinglet.py --heartbeat
 ```
 
 ---
@@ -58,19 +58,19 @@ bash scripts/install-hooks.sh
 
 ```bash
 # Add task with schedule
-./venv/bin/python pinglet.py --task-add my-task \
-  --command /path/to/venv/bin/python \
-  --args script.py --flag \
+uv run python pinglet.py --task-add my-task \
+  --command uv \
+  --args run python script.py --flag \
   --working-dir /path/to/project \
   --name "My Task" \
   --timeout 300 \
   --schedule-spec "daily 7:00"
 
 # Enable it (generates LaunchAgent plist + loads it)
-./venv/bin/python pinglet.py --task-enable my-task
+uv run python pinglet.py --task-enable my-task
 
 # Verify
-./venv/bin/python pinglet.py --task-show my-task
+uv run python pinglet.py --task-show my-task
 ```
 
 ### Available Config Flags
@@ -92,20 +92,20 @@ bash scripts/install-hooks.sh
 
 ```bash
 # Edit (only specified fields update)
-./venv/bin/python pinglet.py --task-edit my-task --timeout 600
+uv run python pinglet.py --task-edit my-task --timeout 600
 
 # Change schedule
-./venv/bin/python pinglet.py --schedule my-task "every 2h"
-./venv/bin/python pinglet.py --task-enable my-task  # reload with new schedule
+uv run python pinglet.py --schedule my-task "every 2h"
+uv run python pinglet.py --task-enable my-task  # reload with new schedule
 
 # Disable (keeps config, removes LaunchAgent)
-./venv/bin/python pinglet.py --task-disable my-task
+uv run python pinglet.py --task-disable my-task
 
 # Remove entirely (auto-disables + removes config + state)
-./venv/bin/python pinglet.py --task-remove my-task
+uv run python pinglet.py --task-remove my-task
 
 # Preview any change first
-./venv/bin/python pinglet.py --task-remove my-task --dry-run
+uv run python pinglet.py --task-remove my-task --dry-run
 ```
 
 ## Monitoring & Self-Protection
@@ -159,7 +159,7 @@ Pinglet implements a detection-recovery-learning flywheel that reduces human int
    +-----------+  +------------------+  |
    | Learning  |  | Tier 2: LLM     |  |
    | Loop      |  | Self-Diagnosis  |  |
-   | (pattern  |  | (claude -p)     |  |
+   | (pattern  |  | (CLI runner)    |  |
    |  update)  |  +--------+--------+  |
    +-----------+           |            |
                      fixed?             |
@@ -185,7 +185,7 @@ Three tiers execute in order. Each tier only fires if the previous one failed.
 | Tier | Action | Trigger |
 |------|--------|---------|
 | 1 | Auto-recovery (bootout + bootstrap) | Every detection of a disabled/failed agent |
-| 2 | LLM self-diagnosis (`claude -p`) | After auto-recovery fails once |
+| 2 | LLM self-diagnosis (`codex exec`, then `claude -p`, optional OpenRouter diagnosis) | After auto-recovery fails once |
 | 3 | Human alert (Slack + macOS) | After `consecutive_detections >= monitoring_alert_threshold` (default: 3) |
 
 ### Learning Loop
@@ -221,7 +221,7 @@ The heartbeat tracks failure patterns per task in `state/_learning.json` and ada
 
 ### `on_failure` Callback
 
-When a task fails the alert threshold, Pinglet can invoke an external command (typically `claude -p`) to diagnose and fix the root cause before alerting a human.
+When a task fails the alert threshold, Pinglet can invoke a subscription-backed runner to diagnose and fix the root cause before alerting a human. `agent_runners.primary`, `secondary`, and `tertiary` control the order, and Pinglet falls back after three consecutive provider failures.
 
 **Without `on_failure`**, failure alerts on Slack include:
 
@@ -239,20 +239,53 @@ tasks:
   my-task:
     command: ./run.py
     on_failure:
-      command: claude
+      command: codex
       args:
         - "-p"
         - "Task {task_id} failed (exit {exit_code}). Read {stderr_file}. Check {learning_file}. Fix if possible."
       timeout: 180
       max_turns: 5
       max_budget_usd: 2.00
+agent_runners:
+  primary:
+    provider: codex
+    subscription: openai
+    model: gpt-5.5
+    command: codex
+  secondary:
+    provider: claude
+    subscription: claude
+    model: sonnet-4.6
+    fallback_model: sonnet-5
+    command: claude
+  tertiary:
+    enabled: false
+    provider: openrouter
+    subscription: openrouter
+    model: qwen/qwen3-coder
+    api_key_env: OPENROUTER_API_KEY
+```
+
+Use explicit paths only if the CLI is not on `PATH`:
+
+```yaml
+agent_runners:
+  primary:
+    provider: codex
+    command: /opt/homebrew/bin/codex
+    model: gpt-5.5
+  secondary:
+    provider: claude
+    command: /opt/homebrew/bin/claude
+    model: sonnet-4.6
+    fallback_model: sonnet-5
 ```
 
 **CLI flags:**
 
 ```bash
 $P --task-add my-task --command ./run.py \
-  --on-failure-command claude \
+  --on-failure-command codex \
   --on-failure-prompt "Task {task_id} failed (exit {exit_code}). Read {stderr_file}. Fix if possible." \
   --on-failure-timeout 180 \
   --on-failure-max-turns 5
@@ -279,14 +312,14 @@ $P --task-add my-task --command ./run.py \
 
 **Sibling: `on_diagnose`** — fires when the **heartbeat** detects a task is stale or its LaunchAgent is disabled (not when the task itself exited non-zero). Same schema, same template variables. If omitted, heartbeat uses a built-in default prompt. Use this to customize how the LLM recovers from missed-run / disabled-agent states.
 
-**Gotcha — Claude Code hooks block the callback:** If you use `claude -p` as the callback and have a `PreToolUse:Bash` hook in `~/.claude/settings.json` that references a per-project path (e.g. `${CLAUDE_PROJECT_DIR}/.claude/hooks/foo.py`), the hook will fail in any project that doesn't have that file, blocking every `Bash` call the LLM tries. The callback exits 0 (the CLI succeeded; the *tools* were denied), so Pinglet thinks it worked. Use absolute paths (`$HOME/.claude/hooks/foo.py`) in Bash hooks.
+**Gotcha:** Claude Code hooks can block callback tools; keep hook paths absolute and reusable across projects.
 
 ### `--status` API
 
 The `--status` command returns a JSON overview of all tasks, the adaptive loop state, and recent activity:
 
 ```bash
-./venv/bin/python pinglet.py --status
+uv run python pinglet.py --status
 ```
 
 Example output (abbreviated):
@@ -328,8 +361,8 @@ Pinglet detects when scheduled pinglets haven't run (e.g., laptop was asleep) an
 ### Install Heartbeat
 
 ```bash
-./venv/bin/python pinglet.py --install-heartbeat
-./venv/bin/python pinglet.py --uninstall-heartbeat
+uv run python pinglet.py --install-heartbeat
+uv run python pinglet.py --uninstall-heartbeat
 ```
 
 ### How It Works
@@ -345,9 +378,9 @@ Pinglet detects when scheduled pinglets haven't run (e.g., laptop was asleep) an
 ### Manual Commands
 
 ```bash
-./venv/bin/python pinglet.py --heartbeat       # Run check now
-./venv/bin/python pinglet.py --run-now uce     # Run a missed task
-./venv/bin/python pinglet.py --ignore uce      # Ignore until next run
+uv run python pinglet.py --heartbeat       # Run check now
+uv run python pinglet.py --run-now uce     # Run a missed task
+uv run python pinglet.py --ignore uce      # Ignore until next run
 ```
 
 ## Output Formatting
@@ -457,23 +490,23 @@ pinglet/
 
 ```bash
 # Show full task debug info (config + state + launchd status + logs)
-./venv/bin/python pinglet.py --task-show <task-id>
+uv run python pinglet.py --task-show <task-id>
 
 # View recent logs for a task
-./venv/bin/python pinglet.py --task-logs <task-id> 100
+uv run python pinglet.py --task-logs <task-id> 100
 
 # Test a task manually
-./venv/bin/python pinglet.py --task <task-id>
+uv run python pinglet.py --task <task-id>
 
 # Check LaunchAgent status (shows disabled agents with exit 78)
-./venv/bin/python pinglet.py --list
+uv run python pinglet.py --list
 
 # Raw launchctl status
 launchctl list | grep pinglet
 
 # Re-enable a disabled agent
-./venv/bin/python pinglet.py --task-enable <task-id>
+uv run python pinglet.py --task-enable <task-id>
 
 # Run tests
-./venv/bin/python -m pytest tests/ -v
+uv run pytest
 ```
